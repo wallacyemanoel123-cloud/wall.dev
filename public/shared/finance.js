@@ -1,0 +1,214 @@
+// Regras financeiras puras (sem banco, sem DOM): usadas pelo servidor e pelo navegador.
+import { convert } from './money.js';
+
+export const TIMEZONE = 'Europe/Dublin';
+export const CATEGORIES = ['Moradia', 'Alimentação', 'Mercado', 'Transporte', 'Combustível', 'Delivery', 'Contas', 'Assinaturas',
+  'Saúde', 'Educação', 'Lazer', 'Roupas', 'Compras', 'Impostos', 'Taxas', 'Salário', 'Freelance', 'Investimentos', 'Outros'];
+
+export function today(tz = TIMEZONE, now = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+}
+
+export function isDate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(s + 'T00:00:00Z');
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+const utc = s => new Date(s + 'T00:00:00Z');
+const iso = d => d.toISOString().slice(0, 10);
+export function addDays(s, n) { const d = utc(s); d.setUTCDate(d.getUTCDate() + n); return iso(d); }
+export function addMonths(s, n) {
+  const d = utc(s), day = d.getUTCDate();
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, 1));
+  const last = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() + 1, 0)).getUTCDate();
+  t.setUTCDate(Math.min(day, last));
+  return iso(t);
+}
+
+export function nextOccurrence(date, frequency) {
+  if (frequency === 'semanal') return addDays(date, 7);
+  if (frequency === 'mensal') return addMonths(date, 1);
+  if (frequency === 'anual') return addMonths(date, 12);
+  throw new Error('Frequência inválida.');
+}
+
+// Intervalo [início, fim] do período que contém a data. Semana começa na segunda.
+export function periodRange(period, date) {
+  if (period === 'diario') return [date, date];
+  if (period === 'semanal') {
+    const dow = (utc(date).getUTCDay() + 6) % 7;
+    const start = addDays(date, -dow);
+    return [start, addDays(start, 6)];
+  }
+  if (period === 'mensal') {
+    const start = date.slice(0, 8) + '01';
+    return [start, addDays(addMonths(start, 1), -1)];
+  }
+  throw new Error('Período inválido.');
+}
+
+const live = t => !t.deleted_at;
+const confirmed = t => live(t) && t.status === 'confirmada';
+
+// Âncora: fotografia de saldo marcada como ponto de partida, a mais recente.
+export function anchorFor(accountId, snapshots) {
+  return snapshots.filter(s => s.account_id === accountId && s.is_anchor)
+    .sort((a, b) => (a.date + a.created_at).localeCompare(b.date + b.created_at)).at(-1) || null;
+}
+
+// Transação entra no saldo calculado se for posterior à âncora
+// (mesma data: só se foi registrada depois da fotografia).
+export function afterAnchor(t, anchor) {
+  if (!anchor) return true;
+  return t.date > anchor.date || (t.date === anchor.date && t.created_at > anchor.created_at);
+}
+
+export function accountBalance(account, snapshots, txs) {
+  const anchor = anchorFor(account.id, snapshots);
+  let balance = anchor ? anchor.amount_cents : 0, pending = 0;
+  for (const t of txs) {
+    if (t.account_id !== account.id || !live(t) || !afterAnchor(t, anchor)) continue;
+    if (t.status === 'confirmada') balance += t.amount_cents; else pending += t.amount_cents;
+  }
+  return { balance, pending, anchor };
+}
+
+// Receitas/despesas reais: transferências e ajustes NUNCA entram aqui.
+export function flows(txs, from, to, currency) {
+  let income = 0, expense = 0;
+  for (const t of txs) {
+    if (!confirmed(t) || t.date < from || t.date > to || (currency && t.currency !== currency)) continue;
+    if (t.kind === 'receita') income += t.amount_cents;
+    else if (t.kind === 'despesa') expense += -t.amount_cents;
+  }
+  return { income, expense, result: income - expense };
+}
+
+export function dashboard({ accounts, snapshots, transactions, investments = [], goals = [], budgets = [], settings = {} }, date = today()) {
+  const rate = Number(settings.eur_brl_milli) || null;
+  const list = accounts.filter(a => !a.archived).map(a => ({ ...a, ...accountBalance(a, snapshots, transactions) }));
+  const byCurrency = {};
+  for (const c of ['EUR', 'BRL']) {
+    const acc = list.filter(a => a.currency === c);
+    const inv = investments.filter(i => i.currency === c).reduce((s, i) => s + (i.current_cents ?? i.invested_cents), 0);
+    const total = acc.reduce((s, a) => s + a.balance, 0);
+    const reserve = acc.filter(a => a.is_reserve).reduce((s, a) => s + a.balance, 0);
+    const [ms, me] = periodRange('mensal', date);
+    byCurrency[c] = { total, reserve, available: total - reserve, investments: inv, net_worth: total + inv, month: flows(transactions, ms, me, c) };
+  }
+  const netWorth = to => {
+    let sum = 0;
+    for (const c of ['EUR', 'BRL']) { const v = convert(byCurrency[c].net_worth, c, to, rate); if (v === null) return null; sum += v; }
+    return sum;
+  };
+  return {
+    date, rate, accounts: list, byCurrency,
+    netWorth: { EUR: netWorth('EUR'), BRL: netWorth('BRL') },
+    pendingCount: transactions.filter(t => live(t) && t.status === 'pendente').length,
+    budgets: budgets.filter(b => b.active).map(b => budgetStatus(b, transactions, date)),
+    goals: goals.map(g => goalProgress(g, { accounts: list, byCurrency, rate, netWorth })),
+  };
+}
+
+export function budgetStatus(budget, txs, date) {
+  const [from, to] = periodRange(budget.period, date);
+  let spent = 0, pending = 0;
+  for (const t of txs) {
+    if (!live(t) || t.kind !== 'despesa' || t.currency !== budget.currency || t.date < from || t.date > to) continue;
+    if (budget.category && t.category !== budget.category) continue;
+    if (t.status === 'confirmada') spent += -t.amount_cents; else pending += -t.amount_cents;
+  }
+  return { ...budget, from, to, spent, pending, remaining: budget.limit_cents - spent, over: spent > budget.limit_cents };
+}
+
+export function goalProgress(goal, { accounts, byCurrency, rate, netWorth }) {
+  let current = goal.saved_cents || 0, note = 'Valor informado manualmente';
+  if (goal.kind === 'patrimonio') { current = netWorth(goal.currency); note = current === null ? 'Informe a taxa EUR→BRL para somar moedas diferentes' : 'Patrimônio calculado (contas + investimentos)'; }
+  else if (goal.kind === 'reserva') { current = convertSum(accounts.filter(a => a.is_reserve), goal.currency, rate); note = 'Saldo das contas de reserva'; }
+  else if (goal.kind === 'conta' && goal.account_id) { const a = accounts.find(x => x.id === goal.account_id); current = a ? convert(a.balance, a.currency, goal.currency, rate) : null; note = a ? 'Saldo da conta ' + a.name : 'Conta não encontrada'; }
+  const pct = current === null || !goal.target_cents ? null : Math.max(0, Math.min(100, Math.round(current * 1000 / goal.target_cents) / 10));
+  return { ...goal, current, pct, note, missing: current === null ? null : Math.max(0, goal.target_cents - current) };
+}
+
+function convertSum(accounts, to, rate) {
+  let s = 0;
+  for (const a of accounts) { const v = convert(a.balance, a.currency, to, rate); if (v === null) return null; s += v; }
+  return s;
+}
+
+// Relatório mensal por moeda: totais, categorias e série diária.
+export function monthlyReport(txs, month, currency) {
+  const from = month + '-01', to = periodRange('mensal', from)[1];
+  const totals = flows(txs, from, to, currency);
+  const cats = new Map(), days = new Map();
+  for (const t of txs) {
+    if (!confirmed(t) || t.currency !== currency || t.date < from || t.date > to || !['receita', 'despesa'].includes(t.kind)) continue;
+    if (t.kind === 'despesa') cats.set(t.category, (cats.get(t.category) || 0) - t.amount_cents);
+    const d = days.get(t.date) || { date: t.date, income: 0, expense: 0 };
+    if (t.kind === 'receita') d.income += t.amount_cents; else d.expense -= t.amount_cents;
+    days.set(t.date, d);
+  }
+  return {
+    month, currency, ...totals,
+    categories: [...cats].map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount),
+    days: [...days.values()].sort((a, b) => a.date.localeCompare(b.date)),
+  };
+}
+
+export function lastMonths(date, n) {
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) out.push(addMonths(date.slice(0, 8) + '01', -i).slice(0, 7));
+  return out;
+}
+
+// Conciliação: compara saldo informado pelo banco com o saldo calculado na mesma data.
+export function reconcile(account, snapshots, txs, reportedCents, date) {
+  const anchor = anchorFor(account.id, snapshots);
+  let computed = anchor && anchor.date <= date ? anchor.amount_cents : 0;
+  for (const t of txs) {
+    if (t.account_id !== account.id || !confirmed(t) || t.date > date) continue;
+    if (anchor && (anchor.date > date || !afterAnchor(t, anchor))) continue;
+    computed += t.amount_cents;
+  }
+  const pending = txs.filter(t => t.account_id === account.id && live(t) && t.status === 'pendente' && t.date <= date)
+    .reduce((s, t) => s + t.amount_cents, 0);
+  return { account_id: account.id, date, reported: reportedCents, computed, difference: reportedCents - computed, pending, matches: reportedCents === computed };
+}
+
+// Possíveis duplicidades para um lançamento candidato (ex.: recibo lido).
+export function findDuplicates(candidate, txs, windowDays = 3) {
+  const abs = Math.abs(candidate.amount_cents);
+  const from = addDays(candidate.date, -windowDays), to = addDays(candidate.date, windowDays);
+  const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[^a-z0-9]/g, '');
+  const m = norm(candidate.merchant);
+  return txs.filter(t => live(t) && t.id !== candidate.id && t.currency === candidate.currency && Math.abs(t.amount_cents) === abs && t.date >= from && t.date <= to)
+    .map(t => {
+      const other = norm(t.merchant || t.description);
+      const sameMerchant = m && other && (other.includes(m) || m.includes(other));
+      return { id: t.id, date: t.date, description: t.description, amount_cents: t.amount_cents, account_id: t.account_id, score: (t.date === candidate.date ? 2 : 1) + (sameMerchant ? 2 : 0) };
+    }).sort((a, b) => b.score - a.score);
+}
+
+export function deliveryStats(shifts) {
+  const by = {};
+  for (const s of shifts) {
+    const c = (by[s.currency] ??= { currency: s.currency, shifts: 0, hours_x100: 0, km_x10: 0, orders: 0, gross: 0, tips: 0, costs: 0 });
+    c.shifts++; c.hours_x100 += s.hours_x100; c.km_x10 += s.km_x10; c.orders += s.orders;
+    c.gross += s.gross_cents; c.tips += s.tips_cents; c.costs += s.costs_cents;
+  }
+  return Object.values(by).map(c => {
+    const net = c.gross + c.tips - c.costs;
+    return { ...c, net, per_hour: c.hours_x100 ? Math.round(net * 100 / c.hours_x100) : null, per_km: c.km_x10 ? Math.round(net * 10 / c.km_x10) : null };
+  });
+}
+
+export function toCSV(rows, columns) {
+  const cell = v => {
+    const s = v === null || v === undefined ? '' : String(v);
+    // Neutraliza fórmulas (=, +, -, @) ao abrir no Excel/Sheets.
+    const safe = /^[=+\-@\t\r]/.test(s) && !/^-?\d+([.,]\d+)?$/.test(s) ? "'" + s : s;
+    return /[";\n\r]/.test(safe) ? '"' + safe.replace(/"/g, '""') + '"' : safe;
+  };
+  return '﻿' + [columns.map(c => cell(c[1])).join(';'), ...rows.map(r => columns.map(c => cell(typeof c[0] === 'function' ? c[0](r) : r[c[0]])).join(';'))].join('\r\n');
+}

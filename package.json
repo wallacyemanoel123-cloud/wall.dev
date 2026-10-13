@@ -1,0 +1,29 @@
+{
+  "name": "wall-finance",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WALL Finance v1.0 — finanças pessoais (módulo do WALL OS) em Cloudflare Pages + D1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node scripts/vendor-ocr.mjs && wrangler pages dev public --port 8788",
+    "db:local": "wrangler d1 migrations apply wall-finance --local",
+    "db:remote": "wrangler d1 migrations apply wall-finance --remote",
+    "test": "node --test tests/unit/*.test.mjs",
+    "test:e2e": "node scripts/vendor-ocr.mjs && node tests/e2e/run.mjs",
+    "hash-password": "node scripts/hash-password.mjs",
+    "icons": "node scripts/make-icons.mjs",
+    "deploy": "node scripts/vendor-ocr.mjs && wrangler pages deploy public --project-name wall-finance --branch main",
+    "build": "node scripts/vendor-ocr.mjs"
+  },
+  "devDependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@tesseract.js-data/por": "^1.0.0",
+    "playwright-core": "1.56.1",
+    "tesseract.js": "^5.1.1",
+    "tesseract.js-core": "^5.1.1",
+    "wrangler": "4.42.0"
+  }
+}

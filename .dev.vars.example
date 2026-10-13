@@ -1,0 +1,6 @@
+# Copie para .dev.vars (que NÃO vai para o Git) e use só em desenvolvimento local.
+# Gere o hash com: npm run hash-password
+OWNER_EMAIL='voce@example.com'
+OWNER_PASSWORD_HASH='pbkdf2-sha256$100000$...$...'
+# Opcional (IA externa, pode ter custo):
+# ANTHROPIC_API_KEY='...'

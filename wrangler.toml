@@ -1,0 +1,11 @@
+# Cloudflare Pages + D1 (plano gratuito). Nenhum segredo neste arquivo.
+name = "wall-finance"
+compatibility_date = "2025-09-01"
+pages_build_output_dir = "public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "wall-finance"
+# Substitua pelo ID exibido em `npx wrangler d1 create wall-finance` (o ID não é segredo).
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

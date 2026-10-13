@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env*
+*.log
+backups/
+seed/*.local.json
+test-results/
+public/vendor/
