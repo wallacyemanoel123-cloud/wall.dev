@@ -189,3 +189,7 @@ code { font-family: var(--mono); font-size: .9em; }
   .kpi { padding: 12px; } .kpi .value { font-size: 17px; } .kpi .sub { font-size: 11px; }
   h1 { font-size: 22px; } .page-head .actions { width: 100%; } .page-head .actions > * { flex: 1 1 auto; }
 }
+.visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+label.file-btn { flex-direction: row; font-size: 15px; color: inherit; position: relative; }
+label.btn.primary { color: var(--accent-ink); }
+label.file-btn:focus-within { outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 2px; }

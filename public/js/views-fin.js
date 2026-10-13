@@ -333,7 +333,7 @@ export async function recibos(host, { refresh }) {
   host.innerHTML = `
     <div class="page-head"><div><h1>Recibos e comprovantes</h1><p>Envie uma foto ou screenshot. O texto é lido <b>no seu aparelho</b>, os dados são sugeridos e nada é lançado sem a sua confirmação.</p></div></div>
     <section class="card">
-      <label class="full">Imagem ou PDF do comprovante<input type="file" id="receipt-file" accept="image/*,application/pdf"></label>
+      <div class="actions"><label class="btn primary file-btn">${icon('camera')} Escolher foto, screenshot ou PDF<input type="file" id="receipt-file" class="visually-hidden" accept="image/*,application/pdf"></label></div>
       <p class="hint">No celular, você pode tirar a foto na hora. Imagens são reduzidas para até ~1,3 MB antes de salvar.</p>
       <div id="receipt-work"></div>
     </section>

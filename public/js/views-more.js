@@ -61,7 +61,7 @@ export async function dados(host, { refresh }) {
         <div class="actions"><a class="btn" href="/api/fin/export.csv" download>Transações (CSV)</a><a class="btn" href="/api/backup" download>Backup (sem anexos)</a><a class="btn primary" href="/api/backup?anexos=1" download>Backup completo</a></div></section>
       <section class="card"><h2>Restaurar backup</h2>
         <p class="muted small">Substitui <b>todos</b> os dados atuais pelos do arquivo. Baixe um backup do estado atual antes.</p>
-        <label>Arquivo de backup (.json)<input type="file" id="restore-file" accept="application/json,.json"></label>
+        <label class="btn file-btn"><span data-file-label="restore-file">Escolher arquivo de backup (.json)</span><input type="file" id="restore-file" class="visually-hidden" accept="application/json,.json"></label>
         <div class="actions"><button data-act="restore" class="danger">Restaurar…</button></div></section>
       <section class="card"><h2>Configuração inicial</h2>
         <p class="muted small">Cole o JSON de contas, saldos de referência e metas (formato no manual). Cria registros novos; não apaga nada.</p>
@@ -69,7 +69,7 @@ export async function dados(host, { refresh }) {
         <div class="actions"><button data-act="setup">Aplicar configuração</button></div></section>
       <section class="card"><h2>Importar do piloto</h2>
         <p class="muted small">Use o arquivo <code>wall-backup.json</code> exportado no piloto (wall-finance-pilot). Lançamentos, metas, diário, checklist, calendário e planos são copiados. Nada é apagado. ${s.pilot_import_at ? `<b>Já importado em ${fmtDateTime(s.pilot_import_at)}.</b>` : ''}</p>
-        <label>Arquivo do piloto<input type="file" id="pilot-file" accept="application/json,.json"></label>
+        <label class="btn file-btn"><span data-file-label="pilot-file">Escolher arquivo do piloto (.json)</span><input type="file" id="pilot-file" class="visually-hidden" accept="application/json,.json"></label>
         <div class="actions"><button data-act="pilot">Importar</button></div></section>
       <section class="card"><h2>Assistente com IA (opcional)</h2>
         ${status.aiConfigured ? `<label class="check"><input type="checkbox" id="ai-toggle"${s.ai_enabled === '1' ? ' checked' : ''}> Usar IA externa nas perguntas do assistente</label><p class="hint">Pode gerar custo na sua conta do provedor. Só totais e metas são enviados.</p>`
@@ -115,6 +115,8 @@ export async function dados(host, { refresh }) {
       onSubmit: async v => { await post('restore', { backup, confirm: v.confirm }); toast('Backup restaurado.'); await refresh(); },
     });
   });
+  // Mostra o nome do arquivo escolhido (o botão nativo não é traduzido em todos os navegadores).
+  host.querySelectorAll('input[type="file"]').forEach(inp => inp.addEventListener('change', () => { const l = host.querySelector(`[data-file-label="${inp.id}"]`); if (l && inp.files[0]) l.textContent = inp.files[0].name; }));
   host.querySelector('#ai-toggle')?.addEventListener('change', async e => { await post('fin/settings', { ai_enabled: e.target.checked }); toast(e.target.checked ? 'IA externa ligada.' : 'IA externa desligada.'); await refresh(); });
 }
 
