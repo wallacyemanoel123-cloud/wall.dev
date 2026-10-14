@@ -8,6 +8,25 @@ export const centsToInput = c => (c === null || c === undefined ? '' : (c / 100)
 export const fmtDate = s => (s ? new Date(s.length === 10 ? s + 'T12:00:00Z' : s).toLocaleDateString('pt-BR', { timeZone: 'UTC', day: '2-digit', month: '2-digit', year: 'numeric' }) : '—');
 export const fmtDateTime = s => (s ? new Date(s).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : '—');
 export const MONTHS = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+// Datas sempre em pt-BR na tela (dd/mm/aaaa); ISO (aaaa-mm-dd) só internamente.
+export const isoToBr = s => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s.slice(8, 10)}/${s.slice(5, 7)}/${s.slice(0, 4)}` : s || '');
+export function brToIso(s) {
+  const t = String(s || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+  const m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  const iso = `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  const d = new Date(iso + 'T00:00:00Z');
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === iso ? iso : null;
+}
+// Máscara simples enquanto digita: 13102026 → 13/10/2026; 0930 → 09:30.
+function mask(el, kind) {
+  el.addEventListener('input', () => {
+    const digits = el.value.replace(/\D/g, '');
+    if (kind === 'date' && !/[-]/.test(el.value)) el.value = [digits.slice(0, 2), digits.slice(2, 4), digits.slice(4, 8)].filter(Boolean).join('/');
+    if (kind === 'time') el.value = [digits.slice(0, 2), digits.slice(2, 4)].filter(Boolean).join(':');
+  });
+}
 export const monthLabel = ym => `${MONTHS[Number(ym.slice(5, 7)) - 1]} de ${ym.slice(0, 4)}`;
 
 const P = {
@@ -32,6 +51,14 @@ const P = {
   scale: 'M12 3v18M5 7h14M5 7l-3 7h6zM19 7l-3 7h6z',
   camera: 'M4 7h4l2-3h4l2 3h4v13H4zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
   close: 'M6 6l12 12M18 6L6 18',
+  briefcase: 'M4 8h16v11H4zM9 8V5h6v3M4 13h16',
+  heart: 'M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10z',
+  globe: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c2.5 2.5 3.5 5.5 3.5 9s-1 6.5-3.5 9c-2.5-2.5-3.5-5.5-3.5-9s1-6.5 3.5-9z',
+  upload: 'M12 16V4M7 9l5-5 5 5M4 20h16',
+  star: 'M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z',
+  up: 'M12 19V5M6 11l6-6 6 6',
+  down: 'M12 5v14M6 13l6 6 6-6',
+  archive: 'M3 5h18v4H3zM5 9v10h14V9M10 13h4',
 };
 export const icon = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${P[name] || P.more}"/></svg>`;
 
@@ -58,9 +85,14 @@ function fieldHtml(f) {
     input = `<textarea id="${id}" name="${f.name}" maxlength="${f.max || 2000}"${req}>${esc(f.value)}</textarea>`;
   } else if (f.type === 'money') {
     input = `<input id="${id}" name="${f.name}" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${esc(centsToInput(f.value))}"${req}>`;
+  } else if (f.type === 'date') {
+    input = `<span class="date-row"><input id="${id}" name="${f.name}" data-mask="date" inputmode="numeric" autocomplete="off" placeholder="dd/mm/aaaa" maxlength="10" value="${esc(isoToBr(f.value))}"${req}>`
+      + `<button type="button" class="small" data-today="${id}">Hoje</button></span>`;
+  } else if (f.type === 'time') {
+    input = `<input id="${id}" name="${f.name}" data-mask="time" inputmode="numeric" autocomplete="off" placeholder="hh:mm" maxlength="5" value="${esc(f.value)}">`;
   } else {
-    const type = f.type === 'decimal' ? 'text' : f.type || 'text';
-    input = `<input id="${id}" name="${f.name}" type="${type}"${f.type === 'decimal' ? ' inputmode="decimal"' : ''} value="${esc(f.value)}"${f.max ? ` maxlength="${f.max}"` : ''}${f.list ? ` list="${id}_l"` : ''}${req}>`;
+    const type = f.type === 'decimal' || f.type === 'number' ? 'text' : f.type || 'text';
+    input = `<input id="${id}" name="${f.name}" type="${type}"${f.type === 'decimal' ? ' inputmode="decimal"' : f.type === 'number' ? ' inputmode="numeric"' : ''} value="${esc(f.value)}"${f.max ? ` maxlength="${f.max}"` : ''}${f.list ? ` list="${id}_l"` : ''}${req}>`;
     if (f.list) input += `<datalist id="${id}_l">${f.list.map(o => `<option value="${esc(o)}">`).join('')}</datalist>`;
   }
   return `<label${cls}>${esc(f.label)}${input}${hint}</label>`;
@@ -78,6 +110,14 @@ function readValues(form, fields) {
       const c = parseAmount(raw);
       if (c === null) throw new Error(`${f.label}: valor inválido. Use, por exemplo, 2.345,67.`);
       out[f.name] = c;
+    } else if (f.type === 'date') {
+      if (!raw) { if (f.required) throw new Error(`${f.label}: informe a data (dd/mm/aaaa).`); out[f.name] = ''; continue; }
+      const iso = brToIso(raw);
+      if (!iso) throw new Error(`${f.label}: data inválida. Use dd/mm/aaaa, por exemplo 13/10/2026.`);
+      out[f.name] = iso;
+    } else if (f.type === 'time') {
+      if (raw && !/^([01]\d|2[0-3]):[0-5]\d$/.test(raw)) throw new Error(`${f.label}: hora inválida. Use hh:mm, por exemplo 09:30.`);
+      out[f.name] = raw;
     } else {
       if (!raw && f.required) throw new Error(`${f.label}: campo obrigatório.`);
       out[f.name] = raw;
@@ -95,6 +135,11 @@ export function openForm({ title, fields, submitLabel = 'Salvar', onSubmit, extr
     <div class="modal-foot">${extra.map((b, i) => `<button type="button" class="${b.danger ? 'danger' : ''}" data-extra="${i}">${esc(b.label)}</button>`).join('')}<span class="spacer"></span>
       <button type="button" data-close>Cancelar</button><button type="submit" class="primary">${esc(submitLabel)}</button></div></form>`;
   const form = dlg.querySelector('form'), err = dlg.querySelector('.form-error');
+  form.querySelectorAll('[data-mask]').forEach(el => mask(el, el.dataset.mask));
+  form.querySelectorAll('[data-today]').forEach(b => b.addEventListener('click', () => {
+    const t = new Intl.DateTimeFormat('pt-BR', { timeZone: 'Europe/Dublin', day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date());
+    form.querySelector('#' + b.dataset.today).value = t;
+  }));
   dlg.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => dlg.close()));
   extra.forEach((b, i) => dlg.querySelector(`[data-extra="${i}"]`).addEventListener('click', async () => {
     try { await b.onClick(dlg); } catch (e) { err.textContent = e.message; }
@@ -147,3 +192,12 @@ export function download(filename, text, type = 'text/plain') {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
+
+// Tema: automático (segue o aparelho), claro ou escuro. Preferência fica só neste aparelho.
+export function applyTheme(theme = (() => { try { return localStorage.getItem('wf-theme') || 'auto'; } catch { return 'auto'; } })()) {
+  if (theme === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.dataset.theme = theme;
+  const dark = theme === 'dark' || (theme === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0d1116' : '#12171d');
+  return theme;
+}
+export function setTheme(theme) { try { localStorage.setItem('wf-theme', theme); } catch { /* modo privado */ } return applyTheme(theme); }

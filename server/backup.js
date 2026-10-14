@@ -5,7 +5,8 @@ import { today } from '../public/shared/finance.js';
 import { parseAmount } from '../public/shared/money.js';
 
 const TABLES = ['fin_accounts', 'fin_snapshots', 'fin_transactions', 'fin_attachments', 'fin_budgets', 'fin_recurring',
-  'fin_delivery_shifts', 'fin_goals', 'fin_investments', 'fin_settings', 'fin_audit', 'os_items', 'os_audit'];
+  'fin_delivery_shifts', 'fin_goals', 'fin_investments', 'fin_investment_ops', 'fin_reserves', 'fin_planned', 'fin_wishlist', 'fin_settings', 'fin_audit',
+  'os_items', 'os_habit_logs', 'os_audit'];
 
 export async function backup(env, withAttachments) {
   const out = { format: 'wall-finance-backup', version: 1, exported_at: nowIso(), revision: await revision(env.DB), tables: {} };

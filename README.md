@@ -1,6 +1,6 @@
-# WALL Finance v1.0
+# WALL OS v1.1 (com WALL Finance)
 
-Aplicativo de finanças pessoais do **WALL OS**: web responsivo, instalável como PWA (celular e notebook), com conta única, banco de dados persistente na Cloudflare (D1) e custo operacional zero dentro do plano gratuito.
+**WALL OS** é a plataforma pessoal (hoje, planejamento, metas, projetos, hábitos, estudos); **WALL Finance** é o módulo financeiro independente dentro dela. Aplicativo web responsivo, instalável como PWA (celular e notebook), com conta única, banco de dados persistente na Cloudflare (D1) e custo operacional zero dentro do plano gratuito.
 
 > **Este repositório é público.** Ele guarda apenas código. Saldos, backups, senhas e chaves **nunca** devem ser enviados para cá.
 
@@ -9,18 +9,22 @@ Aplicativo de finanças pessoais do **WALL OS**: web responsivo, instalável com
 | Área | Recursos |
 | --- | --- |
 | Painel | Patrimônio (com taxa EUR→BRL manual), disponível, reserva, receitas e despesas do mês, contas, orçamentos, metas, pendentes |
-| Contas | Contas independentes em EUR ou BRL; saldo de referência (fotografia com data, fonte e status); reserva protegida |
-| Lançamentos | Receita/despesa com edição, exclusão, categorias, status (confirmada/pendente), anexos, filtros e busca |
+| Contas e reservas | Contas independentes em EUR ou BRL; saldo de referência (fotografia com data, fonte e status); contas fora do orçamento (ex.: moedas do ônibus); **reservas protegidas dentro de uma conta** (meta, valor reservado, déficit) |
+| Lançamentos | Receita/despesa com edição, exclusão lógica, categorias, status (confirmada/pendente), anexos, filtros, busca e **ações em lote** (confirmar, classificar, excluir) |
+| Importar extrato | CSV de qualquer banco (preset Revolut); mapeamento de colunas, prévia, alerta de duplicados, linhas antes do saldo de referência desmarcadas, reimportação sem duplicar |
 | Transferências | Duas pernas ligadas (saída e entrada), inclusive entre moedas; **não** contam como receita nem despesa |
 | Conciliação | Compara o saldo do app do banco com o calculado; registrar, lançar ajuste ou usar como novo ponto de partida, sempre com confirmação |
-| Recibos | Foto/screenshot/PDF → OCR **no aparelho** → data, estabelecimento, valor e moeda sugeridos → alerta de duplicidade → registro só após confirmar |
+| Recibos | Foto/screenshot/PDF → OCR **no aparelho** → data, estabelecimento, valor e moeda → duplicidades → **conta de origem sugerida** → revisar → registrar **ou conciliar** com lançamento existente. Enviar imagem nunca desconta dinheiro |
 | Orçamentos | Diário, semanal (seg–dom) e mensal, por categoria ou geral |
-| Fixas e recorrentes | Lista de compromissos com próxima data; o lançamento é sempre manual (“Lançar” ou “Pular”) |
+| Fixas e planejadas | Recorrentes com próxima data e despesas/receitas planejadas; nada entra no saldo até você tocar em “Lançar” |
 | Delivery | Turnos com horas, km, pedidos, ganhos, gorjetas e custos; €/hora e €/km; lançamento opcional no extrato |
-| Metas e investimentos | Metas de patrimônio, reserva, conta ou manuais; investimentos com valor aplicado/atual |
+| Metas financeiras | Patrimônio, reserva (contas + valores reservados), conta ou manuais |
+| Investimentos | Operações (compra, venda, aporte, resgate, rendimento, taxa) e posição; nenhuma ordem é executada |
+| Lista de desejos | Prioridade, preço, link, situação, ordem; indica se cabe no disponível |
 | Relatórios | Mês a mês, 6 meses em gráfico, categorias, por dia; CSV; impressão/PDF |
-| WALL OS | Hoje (checklist + agenda), objetivos e projetos, planejamento semanal, diário, calendário |
-| Assistente | Análise por regras sobre seus dados (grátis). IA externa opcional, desligada por padrão |
+| WALL OS | Hoje (visão do dia), planejamento, metas de curto/médio/longo prazo, projetos e negócios, calendário, diário, checklist, hábitos (sono, hidratação, exercício), estudos de inglês. Criar, editar, concluir, arquivar e reordenar pela interface |
+| Assistente WALL | Responde por regras (grátis): disponível hoje, quanto falta na reserva, contas da semana, ganhos do delivery, economia do mês, tarefas de hoje, progresso das metas. IA externa opcional, desligada |
+| Interface | 100% pt-BR, datas dd/mm/aaaa em campos próprios (sem controles nativos em inglês), modo claro/escuro/automático, notebook e iPhone |
 | Dados | Backup JSON (com ou sem anexos), restauração, importação do piloto, configuração inicial por JSON, auditoria, sessões |
 
 **Não existe integração bancária.** Nenhum saldo é lido automaticamente e nenhuma movimentação é criada sem uma ação sua.
@@ -31,6 +35,9 @@ Aplicativo de finanças pessoais do **WALL OS**: web responsivo, instalável com
 - **Saldo calculado** = última fotografia marcada como *ponto de partida* + lançamentos **confirmados** posteriores a ela. Pendentes aparecem separados e não alteram o saldo.
 - **Transferências** criam duas pernas com o mesmo `transfer_id`. Excluir uma exclui as duas.
 - **Reserva protegida**: qualquer saída (despesa, transferência, ajuste negativo) exige confirmação explícita. O servidor bloqueia sem ela (HTTP 428).
+- **Reserva dentro da conta** (`fin_reserves`): separa parte do saldo; não é despesa e não duplica saldo. Disponível = saldo − contas-reserva − valores reservados − contas fora do orçamento. Gasto que avançaria sobre o reservado pede confirmação (HTTP 428). Não é possível reservar mais do que existe na conta.
+- **Orçamento diário** mostra quanto pode ser usado de fato: o menor entre o que resta do limite e o disponível livre de reservas.
+- **Confirmadas, pendentes, planejadas e recorrentes** ficam separadas; só confirmadas alteram o saldo.
 - **Fotografias históricas** (ex.: saldos iniciais) entram como “a confirmar” e não geram débitos retroativos.
 - **Auditoria**: toda criação, edição, exclusão, conciliação, importação e restauração grava o antes e o depois (`fin_audit` / `os_audit`).
 - **Edição em dois aparelhos ao mesmo tempo**: cada registro tem versão; a gravação com versão antiga é recusada (HTTP 409) em vez de sobrescrever.
@@ -106,16 +113,19 @@ Entre no app → **Dados e segurança → Configuração inicial**, cole um JSON
 {
   "contas": [
     { "nome": "Conta exemplo EUR", "instituicao": "Banco", "moeda": "EUR", "tipo": "carteira", "saldo": "0,00",
-      "data": "2026-10-13", "fonte": "Último registro informado pelo titular", "status": "a_confirmar" },
-    { "nome": "Reserva de emergência", "moeda": "EUR", "tipo": "reserva", "reserva": true, "meta_reserva": "500,00" }
+      "data": "2026-10-14", "fonte": "Último registro informado pelo titular", "status": "a_confirmar" },
+    { "nome": "Moedas do ônibus", "moeda": "EUR", "tipo": "especie", "fora_do_orcamento": true, "observacao": "Valor não informado" }
   ],
-  "metas": [
-    { "nome": "Meta de patrimônio", "tipo": "patrimonio", "valor": "50.000,00", "moeda": "BRL", "prazo": "2027-10-13" }
-  ]
+  "reservas": [ { "nome": "Emergência", "conta": "Conta exemplo EUR", "meta": "500,00", "reservado": "0,00" } ],
+  "orcamentos": [ { "nome": "Dia a dia", "periodo": "diario", "limite": "5,00", "moeda": "EUR" } ],
+  "metas": [ { "nome": "Meta de patrimônio", "tipo": "patrimonio", "valor": "50.000,00", "moeda": "BRL", "prazo": "2027-10-14" } ],
+  "wall_os": [ { "modulo": "projeto", "titulo": "Meu projeto", "dados": { "tipo": "negocio" } } ]
 }
 ```
 
 Tipos de conta: `banco`, `carteira`, `especie`, `reserva`, `investimento`. Status: `a_confirmar` ou `confirmado`. Depois, informe a taxa EUR→BRL em **Contas e saldos → Taxa EUR→BRL** para o patrimônio em reais.
+
+Extratos: baixe o CSV no app do banco e use **WALL Finance → Importar extrato**. As linhas entram como pendentes; revise e confirme em lote em Lançamentos.
 
 Vindo do piloto (`wall-finance-pilot`)? No piloto, use *Exportar JSON*; aqui, **Dados e segurança → Importar do piloto**. Nada é apagado.
 
@@ -141,10 +151,10 @@ cp .dev.vars.example .dev.vars   # preencha com e-mail e hash de teste
 npm run db:local
 npm run dev                      # http://localhost:8788
 npm test                         # regras financeiras, recibos, senha
-npm run test:e2e                 # ponta a ponta com dois navegadores
+npm run test:e2e                 # migrações com dados + ponta a ponta com dois navegadores e restauração em banco limpo
 ```
 
-## Limitações conhecidas (v1.0)
+## Limitações conhecidas (v1.1)
 
 - Sem integração bancária nem cotação automática (por decisão: nada fictício).
 - Conta única; multiusuário fica para versões futuras.

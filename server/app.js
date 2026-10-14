@@ -2,7 +2,7 @@
 import { HttpError, json, assertSameOrigin, fail } from './http.js';
 import { currentSession, login, logout, listSessions } from './auth.js';
 import { finRoutes } from './fin.js';
-import { osRoutes } from './os.js';
+import { osRoutes, reorder } from './os.js';
 import { backup, restore, importPilot } from './backup.js';
 import { assistantRoutes } from './assistant.js';
 import { revision } from './store.js';
@@ -31,6 +31,7 @@ export async function handle(request, env) {
     if (parts[0] === 'fin') return await finRoutes(request, env, parts.slice(1), url);
     if (parts[0] === 'os') return await osRoutes(request, env, parts.slice(1));
     if (parts[0] === 'assistant') return await assistantRoutes(request, env, parts.slice(1));
+    if (parts[0] === 'reorder' && method === 'POST') return await reorder(request, env);
     if (parts[0] === 'backup' && method === 'GET') return await backup(env, url.searchParams.get('anexos') === '1');
     if (parts[0] === 'restore' && method === 'POST') return await restore(request, env);
     if (parts[0] === 'import' && parts[1] === 'pilot' && method === 'POST') return await importPilot(request, env);

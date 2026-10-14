@@ -6,6 +6,7 @@ import { json, readJson, fail } from './http.js';
 import { loadFinance } from './fin.js';
 import { dashboard, monthlyReport, deliveryStats, today, addMonths } from '../public/shared/finance.js';
 import { formatMoney } from '../public/shared/money.js';
+import { answer, SUGGESTIONS } from '../public/shared/assistant-rules.js';
 
 export function insights(data, date = today()) {
   const d = dashboard(data, date);
@@ -20,6 +21,9 @@ export function insights(data, date = today()) {
   }
   for (const b of d.budgets) if (b.over) out.push({ tipo: 'alerta', texto: `Orçamento “${b.name}” (${b.period}) ultrapassado: ${formatMoney(b.spent, b.currency)} de ${formatMoney(b.limit_cents, b.currency)}.` });
     else if (b.spent > b.limit_cents * 0.8) out.push({ tipo: 'atencao', texto: `Orçamento “${b.name}” acima de 80%: restam ${formatMoney(b.remaining, b.currency)}.` });
+  for (const r of d.reserves) out.push(r.deficit ? { tipo: 'atencao', texto: `Reserva “${r.name}”: faltam ${formatMoney(r.deficit, r.currency)} para ${formatMoney(r.target_cents, r.currency)}.` } : { tipo: 'info', texto: `Reserva “${r.name}” completa.` });
+  for (const r of d.reserves.filter(x => x.overAllocated)) out.push({ tipo: 'alerta', texto: `Reserva “${r.name}” é maior que o saldo calculado de ${r.account_name}. Concilie a conta.` });
+  for (const b of d.budgets.filter(x => x.limitedByAvailability)) out.push({ tipo: 'atencao', texto: `Orçamento “${b.name}”: só ${formatMoney(b.usable, b.currency)} estão livres de reservas.` });
   if (d.pendingCount) out.push({ tipo: 'atencao', texto: `${d.pendingCount} lançamento(s) pendente(s) aguardam sua confirmação.` });
   const unconfirmed = data.snapshots.filter(s => s.status === 'a_confirmar');
   if (unconfirmed.length) out.push({ tipo: 'atencao', texto: `${unconfirmed.length} fotografia(s) de saldo ainda “a confirmar”. Confira no app do banco e concilie.` });
@@ -52,14 +56,18 @@ export async function assistantRoutes(request, env, parts) {
   const data = await loadFinance(env.DB);
   const aiConfigured = Boolean(env.ANTHROPIC_API_KEY);
   const aiEnabled = aiConfigured && data.settings.ai_enabled === '1';
-  if (parts[0] === 'status') return json({ aiConfigured, aiEnabled, model: aiEnabled ? (env.AI_MODEL || 'claude-haiku-5-5') : null });
+  if (parts[0] === 'status') return json({ aiConfigured, aiEnabled, model: aiEnabled ? (env.AI_MODEL || 'claude-haiku-5-5') : null, suggestions: SUGGESTIONS });
   if (parts[0] === 'insights' && request.method === 'GET') return json(insights(data));
   if (parts[0] === 'ask' && request.method === 'POST') {
     const { question } = await readJson(request, 8000);
     const q = String(question || '').trim().slice(0, 2000);
     if (!q) fail(400, 'Escreva sua pergunta.');
     const report = insights(data);
-    if (!aiEnabled) return json({ resposta: null, modo: 'regras', aviso: aiConfigured ? 'IA externa desligada nas configurações.' : 'IA externa não configurada (opcional, pode ter custo). Abaixo, a análise por regras.', analise: report.itens });
+    // 1º: regras gratuitas sobre os dados do sistema.
+    const os = (await env.DB.prepare('SELECT * FROM os_items WHERE deleted_at IS NULL').all()).results;
+    const ruled = answer(q, { fin: data, os, date: today() });
+    if (ruled) return json({ resposta: ruled.texto, modo: 'regras', intent: ruled.intent, fonte: ruled.fonte });
+    if (!aiEnabled) return json({ resposta: null, modo: 'regras', sugestoes: SUGGESTIONS, aviso: 'Não entendi essa pergunta pelas regras. Tente uma destas, ou veja a análise geral abaixo.', analise: report.itens });
     // Envia apenas agregados (sem anexos, sem notas livres) para reduzir exposição de dados.
     const context = { data: report.dashboard.date, porMoeda: report.dashboard.byCurrency, patrimonio: report.dashboard.netWorth, metas: report.dashboard.goals.map(g => ({ nome: g.name, alvo: g.target_cents, atual: g.current, moeda: g.currency, prazo: g.due_date })), orcamentos: report.dashboard.budgets.map(b => ({ nome: b.name, periodo: b.period, gasto: b.spent, limite: b.limit_cents, moeda: b.currency })), alertas: report.itens.map(i => i.texto) };
     const res = await fetch('https://api.anthropic.com/v1/messages', {

@@ -12,7 +12,7 @@
     "db:local": "wrangler d1 migrations apply wall-finance --local",
     "db:remote": "wrangler d1 migrations apply wall-finance --remote",
     "test": "node --test tests/unit/*.test.mjs",
-    "test:e2e": "node scripts/vendor-ocr.mjs && node tests/e2e/run.mjs",
+    "test:e2e": "node scripts/vendor-ocr.mjs && node tests/e2e/migration.mjs && node tests/e2e/run.mjs",
     "hash-password": "node scripts/hash-password.mjs",
     "icons": "node scripts/make-icons.mjs",
     "deploy": "node scripts/vendor-ocr.mjs && wrangler pages deploy public --project-name wall-finance --branch main",

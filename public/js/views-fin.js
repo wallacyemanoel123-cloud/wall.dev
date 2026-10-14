@@ -1,9 +1,11 @@
 // Telas do WALL Finance.
 import { api, post, del } from './api.js';
 import { S, accountName, accountById, activeAccounts, accountOptions } from './state.js';
-import { esc, money, icon, fmtDate, monthLabel, openForm, confirmDialog, withReserveConfirm, toast, centsToInput } from './ui.js';
+import { reorderList } from './lists.js';
+import { esc, money, icon, fmtDate, monthLabel, openForm, confirmDialog, withReserveConfirm, toast, centsToInput, brToIso } from './ui.js';
 import { groupedBars, categoryBars } from './charts.js';
-import { monthlyReport, lastMonths, deliveryStats, budgetStatus, addMonths, periodRange } from '../shared/finance.js';
+import { monthlyReport, lastMonths, deliveryStats, budgetStatus, addMonths, periodRange, findDuplicates } from '../shared/finance.js';
+import { parseCSV, detectColumns, toTransactions } from '../shared/statement.js';
 import { parseReceipt } from '../shared/receipt.js';
 import { formatMoney, parseRateMilli, parseAmount } from '../shared/money.js';
 import { prepareFile, readText } from './ocr.js';
@@ -23,7 +25,7 @@ function txRow(t) {
   return `<div class="row clickable" data-tx="${esc(t.id)}" tabindex="0" role="button" aria-label="Editar ${esc(t.description)}">
     <div class="grow"><div class="title">${esc(t.description)}</div>
     <div class="meta">${fmtDate(t.date)} · ${esc(accountName(t.account_id))} · ${esc(t.kind === 'transferencia' ? 'Transferência' : t.category)}${att ? ` · ${att} anexo(s)` : ''}</div></div>
-    ${t.status === 'pendente' ? '<span class="tag warn">Pendente</span>' : ''}${t.kind === 'transferencia' ? '<span class="tag">Transf.</span>' : ''}${t.kind === 'ajuste' ? '<span class="tag">Ajuste</span>' : ''}
+    ${t.status === 'pendente' ? '<span class="tag warn">Pendente</span>' : ''}${t.reconciled_at ? '<span class="tag ok">Conciliado</span>' : ''}${t.kind === 'transferencia' ? '<span class="tag">Transf.</span>' : ''}${t.kind === 'ajuste' ? '<span class="tag">Ajuste</span>' : ''}
     <span class="amount ${sign(t)}">${money(t.amount_cents, t.currency, { sign: true })}</span></div>`;
 }
 
@@ -124,8 +126,9 @@ export async function painel(host, { refresh }) {
     ${unconfirmed ? `<div class="banner warn">${unconfirmed} saldo(s) de referência ainda “a confirmar”. São fotografias históricas: confira no app do banco e concilie em <a href="#/contas">Contas e saldos</a>.</div>` : ''}
     <div class="kpis">
       ${kpi('Patrimônio (R$)', d.netWorth.BRL === null ? '—' : money(d.netWorth.BRL, 'BRL'), d.rate ? `Taxa manual 1 € = R$ ${(d.rate / 1000).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 })} (${fmtDate(f.settings.eur_brl_date)})` : 'Informe a taxa EUR→BRL em Contas')}
-      ${kpi('Disponível (EUR)', money(e.available, 'EUR'), 'Contas sem reserva')}
-      ${kpi('Reserva protegida (EUR)', money(e.reserve, 'EUR'))}
+      ${kpi('Disponível (EUR)', `<span class="${e.available < 0 ? 'neg' : ''}">${money(e.available, 'EUR')}</span>`, 'Livre de reservas e contas fora do orçamento')}
+      ${kpi('Reservado (EUR)', money(e.reserve, 'EUR'), S.dash.reserves.filter(r => r.currency === 'EUR' && r.deficit).map(r => `${esc(r.name)}: faltam ${money(r.deficit, 'EUR')}`).join(' · ') || 'Reservas protegidas')}
+      ${e.planned30 ? kpi('Planejado 30 dias (EUR)', money(e.planned30, 'EUR'), 'Ainda não lançado') : ''}
       ${kpi('Receitas do mês (EUR)', `<span class="pos">${money(e.month.income, 'EUR')}</span>`)}
       ${kpi('Despesas do mês (EUR)', `<span class="neg">${money(e.month.expense, 'EUR')}</span>`, `Resultado ${money(e.month.result, 'EUR', { sign: true })}`)}
       ${hasBRL ? kpi('Saldo em BRL', money(b.total, 'BRL'), `Mês: +${money(b.month.income, 'BRL')} / −${money(b.month.expense, 'BRL')}`) : ''}
@@ -154,7 +157,8 @@ function budgetList(list) {
   if (!list.length) return empty('Nenhum orçamento ativo.', '<a href="#/orcamentos">Criar orçamento</a>');
   return `<div class="bars-h">${list.map(b => `<div class="item"><span>${esc(b.name)} · <span class="muted">${PERIOD_LABEL[b.period]}</span></span>
     <span class="money ${b.over ? 'neg' : ''}">${money(b.spent, b.currency)} / ${money(b.limit_cents, b.currency)}</span>
-    <progress class="${b.over ? 'over' : b.spent > b.limit_cents * 0.8 ? 'near' : ''}" max="${b.limit_cents}" value="${Math.min(b.spent, b.limit_cents)}" aria-label="${esc(b.name)}"></progress></div>`).join('')}</div>`;
+    <progress class="${b.over ? 'over' : b.spent > b.limit_cents * 0.8 ? 'near' : ''}" max="${b.limit_cents}" value="${Math.min(b.spent, b.limit_cents)}" aria-label="${esc(b.name)}"></progress>
+    ${b.limitedByAvailability ? `<span class="hint neg">Só ${money(b.usable, b.currency)} livres de reservas.</span>` : ''}</div>`).join('')}</div>`;
 }
 
 function goalList(list) {
@@ -166,6 +170,7 @@ function goalList(list) {
 
 // ───────────── Lançamentos ─────────────
 const filters = { month: undefined, account: '', kind: '', status: '', q: '' };
+let selecting = false;
 export async function lancamentos(host, { refresh }) {
   filters.month ??= today().slice(0, 7);
   const f = S.fin;
@@ -184,7 +189,23 @@ export async function lancamentos(host, { refresh }) {
       <label>Status<select name="status"><option value="">Todos</option><option value="confirmada"${filters.status === 'confirmada' ? ' selected' : ''}>Confirmada</option><option value="pendente"${filters.status === 'pendente' ? ' selected' : ''}>Pendente</option></select></label>
       <label>Buscar<input name="q" type="search" value="${esc(filters.q)}" placeholder="Descrição, categoria…"></label>
     </form>
-    <section class="card"><div class="card-head"><h2>${list.length} lançamento(s)</h2></div><div class="list">${list.length ? list.map(txRow).join('') : empty('Nada encontrado com esses filtros.')}</div></section>`;
+    <section class="card"><div class="card-head"><h2>${list.length} lançamento(s)</h2><button class="small" data-act="select">${selecting ? 'Cancelar seleção' : 'Selecionar vários'}</button></div>
+      ${selecting ? `<div class="actions" id="bulk"><label class="check"><input type="checkbox" id="sel-all"> Todos</label><button class="small primary" data-bulk="confirmar">Confirmar</button><button class="small" data-bulk="pendente">Marcar pendente</button><button class="small" data-bulk="categoria">Classificar…</button><button class="small danger" data-bulk="excluir">Excluir</button></div>` : ''}
+      <div class="list">${list.length ? list.map(t => selecting ? `<label class="row check"><input type="checkbox" data-sel="${esc(t.id)}"><span class="grow"><span class="title">${esc(t.description)}</span><br><span class="meta">${fmtDate(t.date)} · ${esc(t.category)} · ${t.status}</span></span><span class="amount ${sign(t)}">${money(t.amount_cents, t.currency, { sign: true })}</span></label>` : txRow(t)).join('') : empty('Nada encontrado com esses filtros.')}</div></section>`;
+  host.querySelector('[data-act="select"]').onclick = () => { selecting = !selecting; lancamentos(host, { refresh }); };
+  host.querySelector('#sel-all')?.addEventListener('change', e => host.querySelectorAll('[data-sel]').forEach(c => { c.checked = e.target.checked; }));
+  host.querySelectorAll('[data-bulk]').forEach(b => b.addEventListener('click', async () => {
+    const ids = [...host.querySelectorAll('[data-sel]:checked')].map(c => c.dataset.sel);
+    if (!ids.length) return toast('Selecione ao menos um lançamento.', 'error');
+    const action = b.dataset.bulk;
+    const run = async extra => {
+      const r = await withReserveConfirm(confirm_reserve => post('fin/transactions/bulk', { ids, action, confirm_reserve, ...extra }));
+      selecting = false; toast(`${r.changed} lançamento(s) atualizados.`); await refresh();
+    };
+    if (action === 'categoria') return openForm({ title: `Classificar ${ids.length} lançamento(s)`, fields: [{ name: 'category', label: 'Categoria', required: true, list: S.fin.categories }], onSubmit: v => run({ category: v.category }) });
+    if (action === 'excluir' && !await confirmDialog('Excluir lançamentos', `Excluir ${ids.length} lançamento(s)? A exclusão é lógica e fica na auditoria.`, { danger: true, confirmLabel: 'Excluir' })) return;
+    try { await run({}); } catch (e) { toast(e.message, 'error'); }
+  }));
   host.querySelector('[data-act="add"]').onclick = () => quickAdd(refresh);
   host.querySelector('[data-act="transfer"]').onclick = () => transferForm(refresh);
   const form = host.querySelector('#filters');
@@ -201,9 +222,17 @@ export async function contas(host, { refresh }) {
     <div class="page-head"><div><h1>Contas e saldos</h1><p>Cada conta parte de uma <b>fotografia de saldo</b> (valor, data e fonte). Depois disso, só lançamentos confirmados alteram o saldo calculado.</p></div>
       <div class="actions"><button class="primary" data-act="new">+ Nova conta</button><button data-act="rate">Taxa EUR→BRL</button></div></div>
     <div class="banner">Sem integração bancária: os saldos são informados por você. Use <b>Conciliar</b> para comparar o saldo do app do banco com o calculado.</div>
+    <section class="card"><div class="card-head"><div><h2>Reservas protegidas</h2><p class="muted small">Separam parte do saldo de uma conta. Não são despesa: o dinheiro continua na conta, mas sai do disponível e gastar dele pede confirmação.</p></div>
+      <button class="small primary" data-act="reserve">+ Nova reserva</button></div>
+      ${S.dash.reserves.length ? `<div class="bars-h">${S.dash.reserves.map(r => `<div class="item"><span><b>${esc(r.name)}</b> · <span class="muted">${esc(r.account_name)}</span>${r.overAllocated ? ' <span class="tag bad">maior que o saldo</span>' : ''}</span>
+        <span class="money">${money(r.allocated_cents, r.currency)} / ${money(r.target_cents, r.currency)}</span>
+        <progress max="${r.target_cents}" value="${Math.min(r.allocated_cents, r.target_cents)}" aria-label="${esc(r.name)}"></progress>
+        <span class="hint">${r.deficit ? `Déficit: ${money(r.deficit, r.currency)}` : 'Reserva completa'} · <button class="small ghost" data-reserve="${esc(r.id)}">Ajustar</button></span></div>`).join('')}</div>` : empty('Nenhuma reserva. Ex.: “Moradia”, meta € 1.200, dentro da conta onde o dinheiro está.')}
+    </section>
     <div class="grid">${d.accounts.map(a => `<section class="card"><div class="card-head"><div><h2>${esc(a.name)}</h2><span class="muted small">${esc(ACCOUNT_KINDS.find(k => k[0] === a.kind)?.[1] || a.kind)}${a.institution ? ' · ' + esc(a.institution) : ''} · ${a.currency}</span></div>${a.is_reserve ? '<span class="tag ok">Reserva protegida</span>' : ''}</div>
       <div><span class="eyebrow">Saldo calculado</span><p class="kpi-value">${money(a.balance, a.currency)}</p></div>
       ${a.pending ? `<p class="small muted">Pendentes (fora do saldo): ${money(a.pending, a.currency, { sign: true })}</p>` : ''}
+      ${a.exclude_from_budget ? '<span class="tag">Fora do orçamento</span>' : ''}${a.notes ? `<p class="small muted">${esc(a.notes)}</p>` : ''}
       ${a.is_reserve && a.reserve_target_cents ? `<progress max="${a.reserve_target_cents}" value="${Math.max(0, Math.min(a.balance, a.reserve_target_cents))}" aria-label="Progresso da reserva"></progress><p class="small muted">Meta da reserva: ${money(a.reserve_target_cents, a.currency)}</p>` : ''}
       <p class="small">${a.anchor ? `Referência: ${money(a.anchor.amount_cents, a.currency)} em ${fmtDate(a.anchor.date)} · ${esc(a.anchor.source)} · ${a.anchor.status === 'confirmado' ? '<span class="tag ok">confirmado</span>' : '<span class="tag warn">a confirmar</span>'}` : '<span class="tag warn">Sem saldo de referência</span>'}</p>
       <div class="actions"><button class="small" data-recon="${esc(a.id)}">Conciliar</button><button class="small" data-snap="${esc(a.id)}">Registrar saldo</button><button class="small" data-hist="${esc(a.id)}">Histórico</button><button class="small ghost" data-edit="${esc(a.id)}">Editar</button></div>
@@ -211,6 +240,8 @@ export async function contas(host, { refresh }) {
     ${archived.length ? `<section class="card"><h2>Arquivadas</h2><div class="list">${archived.map(a => `<div class="row"><div class="grow">${esc(a.name)} (${a.currency})</div><button class="small" data-edit="${esc(a.id)}">Editar</button></div>`).join('')}</div></section>` : ''}`;
   host.querySelector('[data-act="new"]').onclick = () => accountForm(null, refresh);
   host.querySelector('[data-act="rate"]').onclick = () => rateForm(refresh);
+  host.querySelector('[data-act="reserve"]').onclick = () => reserveForm(null, refresh);
+  host.querySelectorAll('[data-reserve]').forEach(b => b.onclick = () => reserveForm(S.fin.reserves.find(r => r.id === b.dataset.reserve), refresh));
   host.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => accountForm(accountById(b.dataset.edit), refresh));
   host.querySelectorAll('[data-snap]').forEach(b => b.onclick = () => snapshotForm(accountById(b.dataset.snap), refresh));
   host.querySelectorAll('[data-recon]').forEach(b => b.onclick = () => reconcileForm(accountById(b.dataset.recon), refresh));
@@ -225,6 +256,8 @@ function accountForm(a, refresh) {
     ...(a ? [] : [{ name: 'currency', label: 'Moeda', type: 'select', options: [['EUR', 'Euro (EUR)'], ['BRL', 'Real (BRL)']], value: 'EUR' }]),
     { name: 'is_reserve', label: 'Reserva protegida (retiradas exigem confirmação)', type: 'checkbox', value: a?.is_reserve, full: true },
     { name: 'reserve_target', label: 'Meta da reserva (opcional)', type: 'money', value: a?.reserve_target_cents },
+    { name: 'exclude_from_budget', label: 'Fora do orçamento (ex.: moedas separadas para o ônibus)', type: 'checkbox', value: a?.exclude_from_budget, full: true },
+    { name: 'notes', label: 'Observações', type: 'textarea', value: a?.notes, max: 1000 },
     ...(a ? [{ name: 'archived', label: 'Arquivar conta (some do painel)', type: 'checkbox', value: a.archived }] : [
       { type: 'info', html: '<b>Saldo de referência</b> — fotografia do saldo numa data. Não gera lançamentos nem débitos retroativos.' },
       { name: 'snap_amount', label: 'Saldo informado', type: 'money', hint: 'Deixe vazio para começar em zero' },
@@ -235,12 +268,29 @@ function accountForm(a, refresh) {
   openForm({
     title: a ? 'Editar conta' : 'Nova conta', fields,
     onSubmit: async v => {
-      const saved = await post('fin/accounts', { id: a?.id, version: a?.version, name: v.name, institution: v.institution, kind: v.kind, currency: v.currency, is_reserve: v.is_reserve, reserve_target_cents: v.reserve_target, archived: v.archived });
+      const saved = await post('fin/accounts', { id: a?.id, version: a?.version, name: v.name, institution: v.institution, kind: v.kind, currency: v.currency, is_reserve: v.is_reserve, reserve_target_cents: v.reserve_target, archived: v.archived, exclude_from_budget: v.exclude_from_budget, notes: v.notes });
       if (!a && v.snap_amount !== null && v.snap_amount !== undefined) {
         await post('fin/snapshots', { account_id: saved.id, amount_cents: v.snap_amount, date: v.snap_date, source: v.snap_source || 'Informado pelo titular', status: v.snap_status, is_anchor: true });
       }
       toast(a ? 'Conta atualizada.' : 'Conta criada.'); await refresh();
     },
+  });
+}
+
+function reserveForm(r, refresh) {
+  if (needAccounts()) return;
+  openForm({
+    title: r ? `Reserva · ${r.name}` : 'Nova reserva protegida',
+    intro: '<div class="banner small">Informe quanto do saldo da conta já está guardado para esta reserva. Ajustar o valor reservado não cria lançamento nem mexe no saldo da conta.</div>',
+    fields: [
+      { name: 'name', label: 'Nome', required: true, value: r?.name, hint: 'Ex.: Moradia' },
+      { name: 'account_id', label: 'Conta onde o dinheiro está', type: 'select', options: accountOptions(), value: r?.account_id },
+      { name: 'target', label: 'Meta da reserva', type: 'money', required: true, value: r?.target_cents },
+      { name: 'allocated', label: 'Valor já reservado', type: 'money', required: true, value: r?.allocated_cents ?? 0 },
+      { name: 'notes', label: 'Observações', type: 'textarea', value: r?.notes },
+      ...(r ? [{ name: 'archived', label: 'Encerrar reserva (libera o valor)', type: 'checkbox', value: r.archived }] : []),
+    ],
+    onSubmit: async v => { await post('fin/reserves', { id: r?.id, version: r?.version, name: v.name, account_id: v.account_id, target_cents: v.target, allocated_cents: v.allocated, notes: v.notes, archived: v.archived }); toast('Reserva salva.'); await refresh(); },
   });
 }
 
@@ -289,7 +339,9 @@ function reconcileForm(a, refresh) {
     if (reported === null) throw new Error('Informe o saldo do banco.');
     const labels = { registrar: 'Registrar a conferência sem alterar saldos?', ajustar: 'Criar um lançamento de ajuste com a diferença? Ele altera o saldo calculado.', ancorar: 'Usar este valor como novo ponto de partida? Lançamentos anteriores deixam de somar no saldo.' };
     if (!await confirmDialog('Confirmar conciliação', labels[mode])) return;
-    await withReserveConfirm(confirm_reserve => post('fin/reconcile', { account_id: a.id, reported_cents: reported, date: form.date.value, source: form.source.value, mode, confirm_reserve }));
+    const date = brToIso(form.date.value);
+    if (!date) throw new Error('Data inválida. Use dd/mm/aaaa.');
+    await withReserveConfirm(confirm_reserve => post('fin/reconcile', { account_id: a.id, reported_cents: reported, date, source: form.source.value, mode, confirm_reserve }));
     d.close(); toast('Conciliação registrada.'); await refresh();
   }
 }
@@ -363,15 +415,15 @@ export async function recibos(host, { refresh }) {
       S.fin.attachments.unshift(att); // aparece na caixa de comprovantes mesmo se você cancelar o lançamento
       if (text) status().innerHTML = `Campos encontrados: ${parsed.found.length ? parsed.found.map(k => ({ date: 'data', merchant: 'estabelecimento', amount_cents: 'valor', currency: 'moeda' }[k])).join(', ') : 'nenhum'}. Comprovante salvo. <details><summary>Texto lido</summary><div class="ocr-text">${esc(text)}</div></details>`;
       else status().textContent = 'Comprovante salvo.';
-      await confirmReceipt(parsed, [att.id], refresh);
+      await confirmReceipt(parsed, [att.id], refresh, text);
     } catch (err) { work.innerHTML = `<div class="banner error">${esc(err.message)}</div>`; }
     e.target.value = '';
   });
-  host.querySelector('#parse-text').onclick = () => confirmReceipt(parseReceipt(host.querySelector('#receipt-text').value), [], refresh);
+  host.querySelector('#parse-text').onclick = () => { const t = host.querySelector('#receipt-text').value; confirmReceipt(parseReceipt(t), [], refresh, t); };
   host.querySelectorAll('[data-launch]').forEach(b => b.onclick = () => {
     const a = inbox.find(x => x.id === b.dataset.launch);
     let ex = {}; try { ex = JSON.parse(a.extracted_json || '{}'); } catch { /* sem dados extraídos */ }
-    confirmReceipt({ date: null, merchant: null, amount_cents: null, currency: null, ...ex }, [a.id], refresh);
+    confirmReceipt({ date: null, merchant: null, amount_cents: null, currency: null, ...ex }, [a.id], refresh, ex.text || '');
   });
   host.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!await confirmDialog('Excluir comprovante', 'O arquivo será removido do banco. A exclusão fica registrada na auditoria.', { danger: true, confirmLabel: 'Excluir' })) return;
@@ -380,23 +432,31 @@ export async function recibos(host, { refresh }) {
 }
 
 // Formulário de confirmação do recibo, com alerta de duplicidade.
-async function confirmReceipt(parsed, attachmentIds, refresh) {
+async function confirmReceipt(parsed, attachmentIds, refresh, text = '') {
   if (needAccounts()) return;
   const currency = parsed.currency || 'EUR';
-  const acc = activeAccounts().find(a => a.currency === currency && !a.is_reserve) || activeAccounts()[0];
-  let dupHtml = '';
+  let duplicates = [], suggestion = null;
   if (parsed.amount_cents && parsed.date) {
-    try {
-      const { duplicates } = await post('fin/receipts/check', { amount_cents: parsed.amount_cents, date: parsed.date, currency, merchant: parsed.merchant });
-      if (duplicates.length) dupHtml = `<div class="banner warn"><b>Possível duplicidade:</b> ${duplicates.slice(0, 3).map(d => `${esc(d.description)} · ${fmtDate(d.date)} · ${money(d.amount_cents, currency)} (${esc(accountName(d.account_id))})`).join('<br>')}<br>Confira antes de registrar.</div>`;
-    } catch { /* verificação é auxiliar */ }
+    try { ({ duplicates, suggestion } = await post('fin/receipts/check', { amount_cents: parsed.amount_cents, date: parsed.date, currency, merchant: parsed.merchant, text })); }
+    catch { /* verificação é auxiliar */ }
   }
+  // Passo 4: conta de origem sugerida (moeda, nome do banco no comprovante, histórico do estabelecimento).
+  const acc = (suggestion && accountById(suggestion.id)) || activeAccounts().find(a => a.currency === currency && !a.is_reserve && !a.exclude_from_budget) || activeAccounts()[0];
   editTransaction(null, refresh, {
     kind: 'despesa', amount_cents: parsed.amount_cents, date: parsed.date || today(), description: parsed.merchant ? `Compra ${parsed.merchant}` : '',
     merchant: parsed.merchant, account_id: acc?.id, status: 'confirmada', attachment_ids: attachmentIds,
   });
   const body = document.querySelector('#dialog .modal-body');
-  if (body) body.insertAdjacentHTML('afterbegin', `<div class="banner small">Dados sugeridos a partir do comprovante. Revise tudo: só será registrado quando você tocar em <b>Salvar</b>.${parsed.currency && parsed.currency !== acc?.currency ? ` Moeda detectada: ${parsed.currency}.` : ''}</div>${dupHtml}`);
+  if (!body) return;
+  const dupHtml = duplicates.length ? `<div class="banner warn"><b>Possível duplicidade.</b> Se o gasto já está registrado, concilie em vez de lançar de novo:
+    <div class="list">${duplicates.slice(0, 3).map(d => `<div class="row"><div class="grow small">${esc(d.description)} · ${fmtDate(d.date)} · ${money(d.amount_cents, currency)} (${esc(accountName(d.account_id))})</div>
+    <button type="button" class="small" data-reconcile="${esc(d.id)}">Conciliar com este</button></div>`).join('')}</div></div>` : '';
+  body.insertAdjacentHTML('afterbegin', `<div class="banner small">Dados sugeridos a partir do comprovante. Nada foi descontado: só será registrado quando você tocar em <b>Salvar</b>.
+    ${suggestion ? `<br>Conta sugerida: <b>${esc(suggestion.name)}</b> (${esc(suggestion.why.join(', '))}).` : ''}${parsed.currency && parsed.currency !== acc?.currency ? ` Moeda detectada: ${parsed.currency}.` : ''}</div>${dupHtml}`);
+  body.querySelectorAll('[data-reconcile]').forEach(b => b.addEventListener('click', async () => {
+    await post(`fin/transactions/${b.dataset.reconcile}/reconcile`, { attachment_ids: attachmentIds });
+    document.getElementById('dialog').close(); toast('Comprovante conciliado com o lançamento existente. Nenhum valor novo foi lançado.'); await refresh();
+  }));
 }
 
 // ───────────── Orçamentos ─────────────
@@ -436,8 +496,8 @@ export async function recorrentes(host, { refresh }) {
   const monthTotal = cur => list.filter(r => r.active && r.kind === 'despesa' && accountById(r.account_id)?.currency === cur)
     .reduce((s, r) => s + (r.frequency === 'mensal' ? r.amount_cents : r.frequency === 'semanal' ? Math.round(r.amount_cents * 52 / 12) : Math.round(r.amount_cents / 12)), 0);
   host.innerHTML = `
-    <div class="page-head"><div><h1>Despesas fixas e recorrentes</h1><p>O sistema avisa a próxima data, mas <b>não lança sozinho</b>. Toque em “Lançar” quando o pagamento acontecer.</p></div>
-      <div class="actions"><button class="primary" data-act="new">+ Nova recorrência</button></div></div>
+    <div class="page-head"><div><h1>Fixas, recorrentes e planejadas</h1><p>Nada aqui mexe no saldo. O sistema avisa as datas, mas <b>não lança sozinho</b>: toque em “Lançar” quando o pagamento acontecer.</p></div>
+      <div class="actions"><button class="primary" data-act="new">+ Recorrência</button><button data-act="plan">+ Planejada</button></div></div>
     <div class="kpis"><div class="kpi"><span class="eyebrow">Compromisso mensal (EUR)</span><span class="value">${money(monthTotal('EUR'), 'EUR')}</span></div>
       <div class="kpi"><span class="eyebrow">Compromisso mensal (BRL)</span><span class="value">${money(monthTotal('BRL'), 'BRL')}</span></div></div>
     <section class="card">${list.length ? `<div class="list">${list.map(r => { const acc = accountById(r.account_id); const late = r.active && r.next_date < today(); return `<div class="row"><div class="grow">
@@ -445,7 +505,19 @@ export async function recorrentes(host, { refresh }) {
       <div class="meta">${FREQ_LABEL[r.frequency]} · próxima ${fmtDate(r.next_date)} ${late ? '<span class="tag warn">vencida</span>' : ''} · ${esc(acc?.name || '')}</div></div>
       <span class="amount ${r.kind === 'despesa' ? 'neg' : 'pos'}">${money(r.kind === 'despesa' ? -r.amount_cents : r.amount_cents, acc?.currency || 'EUR', { sign: true })}</span>
       ${r.active ? `<button class="small" data-launch="${esc(r.id)}">Lançar</button><button class="small ghost" data-skip="${esc(r.id)}">Pular</button>` : ''}<button class="small ghost" data-edit="${esc(r.id)}">Editar</button></div>`; }).join('')}</div>` : empty('Nenhuma recorrência cadastrada.')}</section>`;
+  host.insertAdjacentHTML('beforeend', plannedSection());
   host.querySelector('[data-act="new"]').onclick = () => recurringForm(null, refresh);
+  host.querySelector('[data-act="plan"]').onclick = () => plannedForm(null, refresh);
+  host.querySelectorAll('[data-plan-edit]').forEach(b => b.onclick = () => plannedForm(S.fin.planned.find(p => p.id === b.dataset.planEdit), refresh));
+  host.querySelectorAll('[data-plan-launch]').forEach(b => b.onclick = () => {
+    const p = S.fin.planned.find(x => x.id === b.dataset.planLaunch);
+    openForm({
+      title: `Lançar · ${p.description}`, submitLabel: 'Lançar',
+      fields: [{ name: 'account_id', label: 'Conta', type: 'select', options: accountOptions(), value: p.account_id }, { name: 'amount', label: 'Valor', type: 'money', required: true, value: p.amount_cents },
+        { name: 'date', label: 'Data', type: 'date', required: true, value: p.due_date || today() }, { name: 'status', label: 'Status', type: 'select', options: [['confirmada', 'Confirmada'], ['pendente', 'Pendente']], value: 'confirmada' }],
+      onSubmit: async v => { await withReserveConfirm(confirm_reserve => post(`fin/planned/${p.id}/launch`, { account_id: v.account_id, amount_cents: v.amount, date: v.date, status: v.status, confirm_reserve })); toast('Lançado.'); await refresh(); },
+    });
+  });
   host.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => recurringForm(list.find(x => x.id === b.dataset.edit), refresh));
   host.querySelectorAll('[data-skip]').forEach(b => b.onclick = async () => { if (await confirmDialog('Pular ocorrência', 'Avançar para a próxima data sem lançar nada?')) { await post(`fin/recurring/${b.dataset.skip}/skip`); await refresh(); } });
   host.querySelectorAll('[data-launch]').forEach(b => b.onclick = () => {
@@ -456,6 +528,36 @@ export async function recorrentes(host, { refresh }) {
         { name: 'status', label: 'Status', type: 'select', options: [['confirmada', 'Confirmada'], ['pendente', 'Pendente']], value: 'confirmada' }],
       onSubmit: async v => { await withReserveConfirm(confirm_reserve => post(`fin/recurring/${r.id}/launch`, { amount_cents: v.amount, date: v.date, status: v.status, confirm_reserve })); toast('Lançado.'); await refresh(); },
     });
+  });
+}
+
+function plannedSection() {
+  const list = (S.fin.planned || []).filter(p => p.status === 'planejada');
+  const done = (S.fin.planned || []).filter(p => p.status !== 'planejada').slice(0, 10);
+  const row = p => `<div class="row"><div class="grow"><div class="title">${esc(p.description)} <span class="tag">${p.status === 'planejada' ? 'Planejada' : p.status === 'lancada' ? 'Lançada' : 'Cancelada'}</span></div>
+    <div class="meta">${p.due_date ? fmtDate(p.due_date) : 'Sem data'} · ${esc(p.category)}${p.account_id ? ' · ' + esc(accountName(p.account_id)) : ''}${p.due_date && p.due_date < today() && p.status === 'planejada' ? ' · <span class="neg">data passou</span>' : ''}</div></div>
+    <span class="amount ${p.kind === 'despesa' ? 'neg' : 'pos'}">${money(p.kind === 'despesa' ? -p.amount_cents : p.amount_cents, p.currency, { sign: true })}</span>
+    ${p.status === 'planejada' ? `<button class="small" data-plan-launch="${esc(p.id)}">Lançar</button>` : ''}<button class="small ghost" data-plan-edit="${esc(p.id)}">Editar</button></div>`;
+  return `<section class="card"><div class="card-head"><div><h2>Planejadas</h2><p class="muted small">Gastos ou receitas previstos uma vez (ex.: passagem, curso). Ficam fora do saldo e aparecem como “planejado” no painel.</p></div></div>
+    <div class="list">${list.map(row).join('') || empty('Nada planejado.')}</div>${done.length ? `<details><summary>Lançadas e canceladas</summary><div class="list">${done.map(row).join('')}</div></details>` : ''}</section>`;
+}
+
+function plannedForm(p, refresh) {
+  openForm({
+    title: p ? 'Editar planejada' : 'Nova despesa/receita planejada',
+    fields: [
+      { name: 'description', label: 'Descrição', required: true, value: p?.description, full: true },
+      { name: 'kind', label: 'Tipo', type: 'select', options: [['despesa', 'Despesa'], ['receita', 'Receita']], value: p?.kind || 'despesa' },
+      { name: 'amount', label: 'Valor previsto', type: 'money', required: true, value: p?.amount_cents },
+      { name: 'account_id', label: 'Conta prevista', type: 'select', options: [['', '— definir depois —'], ...accountOptions()], value: p?.account_id || '' },
+      { name: 'currency', label: 'Moeda (se sem conta)', type: 'select', options: ['EUR', 'BRL'], value: p?.currency || 'EUR' },
+      { name: 'due_date', label: 'Data prevista', type: 'date', value: p?.due_date || '' },
+      { name: 'category', label: 'Categoria', value: p?.category || 'Outros', list: S.fin.categories },
+      ...(p ? [{ name: 'status', label: 'Situação', type: 'select', options: [['planejada', 'Planejada'], ['cancelada', 'Cancelada']], value: p.status === 'lancada' ? 'planejada' : p.status }] : []),
+      { name: 'notes', label: 'Notas', type: 'textarea', value: p?.notes },
+    ],
+    extra: p ? [{ label: 'Excluir', danger: true, onClick: async d => { if (await confirmDialog('Excluir planejada', `Excluir “${p.description}”?`, { danger: true, confirmLabel: 'Excluir' })) { await del('fin/planned/' + p.id); d.close(); await refresh(); } } }] : [],
+    onSubmit: async v => { await post('fin/planned', { id: p?.id, version: p?.version, description: v.description, kind: v.kind, amount_cents: v.amount, account_id: v.account_id || null, currency: v.currency, due_date: v.due_date || null, category: v.category, status: p?.status === 'lancada' ? 'lancada' : v.status, notes: v.notes }); toast('Salvo.'); await refresh(); },
   });
 }
 
@@ -530,20 +632,160 @@ function shiftForm(s, refresh) {
 
 // ───────────── Metas e investimentos ─────────────
 export async function metas(host, { refresh }) {
-  const inv = S.fin.investments;
   host.innerHTML = `
-    <div class="page-head"><div><h1>Metas e investimentos</h1><p>Metas de patrimônio e de reserva são calculadas automaticamente a partir dos saldos; metas manuais usam o valor que você informa.</p></div>
-      <div class="actions"><button class="primary" data-act="goal">+ Nova meta</button><button data-act="inv">+ Investimento</button></div></div>
-    <section class="card"><h2>Metas</h2>${goalList(S.dash.goals)}<div class="actions">${S.dash.goals.map(g => `<button class="small ghost" data-goal="${esc(g.id)}">Editar “${esc(g.name)}”</button>`).join('')}</div></section>
-    <section class="card"><h2>Investimentos</h2>${inv.length ? `<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Classe</th><th class="r">Aplicado</th><th class="r">Valor atual</th><th class="r">Resultado</th><th>Avaliado em</th><th></th></tr></thead><tbody>
-      ${inv.map(i => { const cur = i.current_cents ?? i.invested_cents; return `<tr><td>${esc(i.name)}</td><td>${esc(i.kind)}</td><td class="r money">${money(i.invested_cents, i.currency)}</td>
-        <td class="r money">${i.current_cents === null ? '<span class="muted">não informado</span>' : money(i.current_cents, i.currency)}</td><td class="r money ${cur - i.invested_cents < 0 ? 'neg' : 'pos'}">${money(cur - i.invested_cents, i.currency, { sign: true })}</td>
-        <td>${fmtDate(i.valued_at)}</td><td><button class="small ghost" data-inv="${esc(i.id)}">Editar</button></td></tr>`; }).join('')}</tbody></table></div>
-      <p class="hint">Valores informados manualmente; sem cotação automática conectada.</p>` : empty('Nenhum investimento registrado.')}</section>`;
+    <div class="page-head"><div><h1>Metas financeiras</h1><p>Patrimônio e reserva são calculados pelos saldos e reservas; metas manuais usam o valor que você informa.</p></div>
+      <div class="actions"><button class="primary" data-act="goal">+ Nova meta</button></div></div>
+    <section class="card">${goalList(S.dash.goals)}<div class="actions">${S.dash.goals.map(g => `<button class="small ghost" data-goal="${esc(g.id)}">Editar “${esc(g.name)}”</button>`).join('')}</div></section>`;
   host.querySelector('[data-act="goal"]').onclick = () => goalForm(null, refresh);
-  host.querySelector('[data-act="inv"]').onclick = () => investmentForm(null, refresh);
   host.querySelectorAll('[data-goal]').forEach(b => b.onclick = () => goalForm(S.fin.goals.find(g => g.id === b.dataset.goal), refresh));
-  host.querySelectorAll('[data-inv]').forEach(b => b.onclick = () => investmentForm(inv.find(i => i.id === b.dataset.inv), refresh));
+}
+
+// ───────────── Investimentos: registro de operações e posições (nada é comprado automaticamente) ─────────────
+const OP_LABEL = { compra: 'Compra', venda: 'Venda', aporte: 'Aporte', resgate: 'Resgate', rendimento: 'Rendimento', taxa: 'Taxa' };
+export async function investimentos(host, { refresh }) {
+  const pos = S.dash.positions;
+  const total = c => pos.filter(p => p.currency === c).reduce((s, p) => s + p.value, 0);
+  host.innerHTML = `
+    <div class="page-head"><div><h1>Investimentos</h1><p>Registre compras, vendas, aportes, rendimentos e taxas. O app só acompanha: nenhuma ordem é enviada e nenhum dinheiro sai das contas automaticamente.</p></div>
+      <div class="actions"><button class="primary" data-act="inv">+ Investimento</button></div></div>
+    <div class="kpis"><div class="kpi"><span class="eyebrow">Posição EUR</span><span class="value">${money(total('EUR'), 'EUR')}</span></div><div class="kpi"><span class="eyebrow">Posição BRL</span><span class="value">${money(total('BRL'), 'BRL')}</span></div></div>
+    ${pos.length ? pos.map(p => `<section class="card"><div class="card-head"><div><h2>${esc(p.name)}</h2><span class="muted small">${esc(p.kind)} · ${p.currency}${p.valued_at ? ' · avaliado em ' + fmtDate(p.valued_at) : ''}</span></div>
+      <div class="actions"><button class="small" data-op="${esc(p.id)}">+ Operação</button><button class="small ghost" data-inv="${esc(p.id)}">Editar</button></div></div>
+      <div class="kpis"><div class="kpi"><span class="eyebrow">Aplicado</span><span class="value">${money(p.invested, p.currency)}</span></div>
+        <div class="kpi"><span class="eyebrow">Valor atual</span><span class="value">${money(p.value, p.currency)}</span><span class="sub">${p.current_cents === null ? 'Não informado: usando o aplicado' : 'Informado manualmente'}</span></div>
+        <div class="kpi"><span class="eyebrow">Resultado</span><span class="value ${p.result < 0 ? 'neg' : 'pos'}">${money(p.result, p.currency, { sign: true })}</span><span class="sub">Rendimentos ${money(p.income, p.currency)} · taxas ${money(p.fees, p.currency)}</span></div>
+        ${p.quantity_micro ? `<div class="kpi"><span class="eyebrow">Quantidade</span><span class="value">${(p.quantity_micro / 1e6).toLocaleString('pt-BR', { maximumFractionDigits: 6 })}</span></div>` : ''}</div>
+      ${(S.fin.investmentOps || []).filter(o => o.investment_id === p.id).length ? `<div class="table-wrap"><table><thead><tr><th>Data</th><th>Operação</th><th class="r">Quantidade</th><th class="r">Valor</th><th></th></tr></thead><tbody>
+        ${S.fin.investmentOps.filter(o => o.investment_id === p.id).map(o => `<tr><td>${fmtDate(o.date)}</td><td>${OP_LABEL[o.type]}</td><td class="r num">${o.quantity_micro ? (o.quantity_micro / 1e6).toLocaleString('pt-BR', { maximumFractionDigits: 6 }) : '—'}</td><td class="r money">${money(o.total_cents, p.currency)}</td><td><button class="small ghost" data-editop="${esc(o.id)}">Editar</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">Nenhuma operação registrada.</p>'}
+    </section>`).join('') : `<section class="card">${empty('Nenhum investimento registrado.')}</section>`}`;
+  host.querySelector('[data-act="inv"]').onclick = () => investmentForm(null, refresh);
+  host.querySelectorAll('[data-inv]').forEach(b => b.onclick = () => investmentForm(S.fin.investments.find(i => i.id === b.dataset.inv), refresh));
+  host.querySelectorAll('[data-op]').forEach(b => b.onclick = () => opForm(S.fin.investments.find(i => i.id === b.dataset.op), null, refresh));
+  host.querySelectorAll('[data-editop]').forEach(b => b.onclick = () => { const o = S.fin.investmentOps.find(x => x.id === b.dataset.editop); opForm(S.fin.investments.find(i => i.id === o.investment_id), o, refresh); });
+}
+
+function opForm(inv, o, refresh) {
+  openForm({
+    title: `${o ? 'Editar operação' : 'Nova operação'} · ${inv.name}`,
+    intro: '<div class="banner small">Apenas registro. Para refletir o dinheiro saindo da conta, faça também uma transferência para uma conta de investimento.</div>',
+    fields: [
+      { name: 'type', label: 'Operação', type: 'select', options: Object.entries(OP_LABEL), value: o?.type || 'compra' },
+      { name: 'date', label: 'Data', type: 'date', required: true, value: o?.date || today() },
+      { name: 'total', label: `Valor total (${inv.currency})`, type: 'money', required: true, value: o?.total_cents },
+      { name: 'quantity', label: 'Quantidade (cotas/ações, opcional)', type: 'decimal', value: o?.quantity_micro ? String(o.quantity_micro / 1e6).replace('.', ',') : '' },
+      { name: 'notes', label: 'Notas', type: 'textarea', value: o?.notes },
+    ],
+    extra: o ? [{ label: 'Excluir', danger: true, onClick: async d => { if (await confirmDialog('Excluir operação', 'Excluir este registro?', { danger: true, confirmLabel: 'Excluir' })) { await del('fin/investment-ops/' + o.id); d.close(); await refresh(); } } }] : [],
+    onSubmit: async v => { await post('fin/investment-ops', { id: o?.id, version: o?.version, investment_id: inv.id, type: v.type, date: v.date, total_cents: v.total, quantity_micro: decimalX(v.quantity, 1e6), notes: v.notes }); toast('Operação registrada.'); await refresh(); },
+  });
+}
+
+// ───────────── Lista de desejos ─────────────
+const PRIORITY = { alta: 'Alta', media: 'Média', baixa: 'Baixa' };
+export async function desejos(host, { refresh }) {
+  const list = S.fin.wishlist || [];
+  const active = list.filter(w => w.status === 'desejo');
+  const sum = c => active.filter(w => w.currency === c && w.price_cents).reduce((s, w) => s + w.price_cents, 0);
+  const avail = S.dash.byCurrency.EUR.available;
+  host.innerHTML = `
+    <div class="page-head"><div><h1>Lista de desejos</h1><p>Coisas que você quer comprar, com prioridade. Nada é comprado nem reservado automaticamente.</p></div>
+      <div class="actions"><button class="primary" data-act="new">+ Desejo</button></div></div>
+    <div class="kpis"><div class="kpi"><span class="eyebrow">Total desejado (EUR)</span><span class="value">${money(sum('EUR'), 'EUR')}</span><span class="sub">Disponível agora: ${money(avail, 'EUR')}</span></div>
+      ${sum('BRL') ? `<div class="kpi"><span class="eyebrow">Total desejado (BRL)</span><span class="value">${money(sum('BRL'), 'BRL')}</span></div>` : ''}</div>
+    <section class="card"><div class="list" id="wish">${list.map((w, k) => `<div class="row"><div class="grow"><div class="title">${esc(w.name)} ${w.status !== 'desejo' ? `<span class="tag">${w.status === 'comprado' ? 'Comprado' : 'Descartado'}</span>` : `<span class="tag ${w.priority === 'alta' ? 'warn' : ''}">${PRIORITY[w.priority]}</span>`}</div>
+      <div class="meta">${w.price_cents ? money(w.price_cents, w.currency) : 'Preço a definir'}${w.price_cents && w.status === 'desejo' && w.currency === 'EUR' ? (w.price_cents <= avail ? ' · cabe no disponível' : ' · ainda não cabe no disponível') : ''}${w.url ? ` · <a href="${esc(w.url)}" target="_blank" rel="noopener noreferrer">link</a>` : ''}</div></div>
+      <button class="small ghost" data-up="${k}" aria-label="Subir ${esc(w.name)}"${k === 0 ? ' disabled' : ''}>${icon('up')}</button><button class="small ghost" data-down="${k}" aria-label="Descer ${esc(w.name)}"${k === list.length - 1 ? ' disabled' : ''}>${icon('down')}</button>
+      <button class="small ghost" data-edit="${esc(w.id)}">Editar</button></div>`).join('') || empty('Lista vazia.')}</div></section>`;
+  host.querySelector('[data-act="new"]').onclick = () => wishForm(null, refresh);
+  host.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => wishForm(list.find(w => w.id === b.dataset.edit), refresh));
+  host.querySelectorAll('[data-up],[data-down]').forEach(b => b.onclick = () => reorderList('fin_wishlist', list, Number(b.dataset.up ?? b.dataset.down), b.dataset.up !== undefined ? -1 : 1, refresh));
+}
+
+function wishForm(w, refresh) {
+  openForm({
+    title: w ? 'Editar desejo' : 'Novo desejo',
+    fields: [
+      { name: 'name', label: 'O que você quer', required: true, value: w?.name, full: true },
+      { name: 'price', label: 'Preço estimado', type: 'money', value: w?.price_cents },
+      { name: 'currency', label: 'Moeda', type: 'select', options: ['EUR', 'BRL'], value: w?.currency || 'EUR' },
+      { name: 'priority', label: 'Prioridade', type: 'select', options: Object.entries(PRIORITY), value: w?.priority || 'media' },
+      { name: 'status', label: 'Situação', type: 'select', options: [['desejo', 'Desejo'], ['comprado', 'Comprado'], ['descartado', 'Descartado']], value: w?.status || 'desejo' },
+      { name: 'url', label: 'Link (opcional)', value: w?.url, full: true },
+      { name: 'notes', label: 'Notas', type: 'textarea', value: w?.notes },
+    ],
+    extra: w ? [{ label: 'Excluir', danger: true, onClick: async d => { if (await confirmDialog('Excluir desejo', `Excluir “${w.name}”?`, { danger: true, confirmLabel: 'Excluir' })) { await del('fin/wishlist/' + w.id); d.close(); await refresh(); } } }] : [],
+    onSubmit: async v => { await post('fin/wishlist', { id: w?.id, version: w?.version, name: v.name, price_cents: v.price, currency: v.currency, priority: v.priority, status: v.status, url: v.url, notes: v.notes }); toast('Salvo.'); await refresh(); },
+  });
+}
+
+// ───────────── Importar extrato CSV ─────────────
+let csvState = null;
+export async function extrato(host, { refresh }) {
+  host.innerHTML = `
+    <div class="page-head"><div><h1>Importar extrato (CSV)</h1><p>Baixe o extrato em CSV no app do banco (Revolut: Conta → Extrato → Excel/CSV; AstroPay ou outros: exportar movimentações) e envie aqui. Não há conexão direta com bancos.</p></div></div>
+    <section class="card">
+      <div class="actions"><label class="btn primary file-btn">${icon('upload')} Escolher arquivo CSV<input type="file" id="csv-file" class="visually-hidden" accept=".csv,text/csv,text/plain"></label></div>
+      <p class="hint">O arquivo é lido no seu aparelho. Só as linhas que você marcar são enviadas ao banco de dados.</p>
+      <div id="csv-work"></div></section>`;
+  const work = host.querySelector('#csv-work');
+  host.querySelector('#csv-file').addEventListener('change', async e => {
+    const file = e.target.files[0]; if (!file) return;
+    if (file.size > 3_000_000) { work.innerHTML = '<div class="banner error">Arquivo maior que 3 MB. Exporte um período menor.</div>'; return; }
+    const parsed = parseCSV(await file.text());
+    csvState = { parsed, cols: detectColumns(parsed.headers), name: file.name };
+    renderCsv(work, refresh);
+  });
+  if (csvState) renderCsv(work, refresh);
+}
+
+function renderCsv(work, refresh) {
+  const { parsed, cols } = csvState;
+  const opts = (sel) => `<option value="-1">— nenhuma —</option>${parsed.headers.map((h, k) => `<option value="${k}"${k === sel ? ' selected' : ''}>${esc(h)}</option>`).join('')}`;
+  const acc = accountById(csvState.account) || activeAccounts().find(a => !a.is_reserve) || activeAccounts()[0];
+  if (!acc) { work.innerHTML = '<div class="banner warn">Cadastre a conta do extrato primeiro em Contas e reservas.</div>'; return; }
+  csvState.account = acc.id;
+  const { rows, errors } = toTransactions(parsed, cols, acc.currency);
+  const anchor = S.dash.accounts.find(a => a.id === acc.id)?.anchor;
+  const marked = rows.map(r => {
+    const dups = findDuplicates({ amount_cents: r.amount_cents, date: r.date, currency: acc.currency, merchant: r.description }, S.fin.transactions.filter(t => t.account_id === acc.id), 1);
+    const before = anchor && r.date <= anchor.date;
+    return { ...r, dup: dups[0], before, include: !dups.length && !before };
+  });
+  csvState.rows = marked;
+  work.innerHTML = `
+    <div class="banner small">Formato detectado: <b>${esc(cols.preset)}</b> · ${parsed.rows.length} linha(s) em “${esc(csvState.name)}”. Confira as colunas.</div>
+    <form id="csv-map" class="filters">
+      <label>Conta do extrato<select name="account">${accountOptions().map(([v, l]) => `<option value="${esc(v)}"${v === acc.id ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+      ${['date:Data', 'description:Descrição', 'amount:Valor (com sinal)', 'debit:Débito', 'credit:Crédito', 'fee:Taxa', 'state:Situação'].map(x => { const [k, l] = x.split(':'); return `<label>${l}<select name="${k}">${opts(cols[k])}</select></label>`; }).join('')}
+      <label>Importar como<select name="status"><option value="pendente">Pendente (revisar depois)</option><option value="confirmada">Confirmada (entra no saldo)</option></select></label>
+    </form>
+    ${anchor ? `<div class="banner small">Linhas até ${fmtDate(anchor.date)} (data do saldo de referência de ${esc(acc.name)}) vêm desmarcadas: já estão contidas no saldo e importá-las não mudaria o saldo, só o histórico.</div>` : ''}
+    ${errors.length ? `<details><summary>${errors.length} linha(s) ignorada(s)</summary><p class="small">${errors.slice(0, 50).map(e => `Linha ${e.line}: ${esc(e.reason)}`).join('<br>')}</p></details>` : ''}
+    <div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="csv-all" aria-label="Marcar todas"></th><th>Data</th><th>Descrição</th><th class="r">Valor</th><th>Observação</th></tr></thead><tbody>
+      ${marked.map((r, k) => `<tr><td><input type="checkbox" data-row="${k}"${r.include ? ' checked' : ''} aria-label="Importar linha ${r.line}"></td><td>${fmtDate(r.date)}</td><td>${esc(r.description)}</td>
+        <td class="r money ${r.amount_cents < 0 ? 'neg' : 'pos'}">${money(r.amount_cents, acc.currency, { sign: true })}</td>
+        <td class="small">${r.dup ? `<span class="tag warn">Possível duplicado</span> ${esc(r.dup.description)}` : ''}${r.before ? '<span class="tag">Antes do saldo de referência</span>' : ''}${r.pending ? '<span class="tag warn">Pendente no banco</span>' : ''}</td></tr>`).join('')}</tbody></table></div>
+    <div class="actions"><button class="primary" id="csv-import">Importar linhas marcadas</button><button id="csv-cancel">Cancelar</button></div>`;
+  const map = work.querySelector('#csv-map');
+  map.addEventListener('change', () => {
+    const f = Object.fromEntries(new FormData(map));
+    csvState.account = f.account; csvState.status = f.status;
+    for (const k of ['date', 'description', 'amount', 'debit', 'credit', 'fee', 'state']) cols[k] = Number(f[k]);
+    renderCsv(work, refresh);
+  });
+  if (csvState.status) map.status.value = csvState.status;
+  work.querySelector('#csv-all').addEventListener('change', e => work.querySelectorAll('[data-row]').forEach(c => { c.checked = e.target.checked; }));
+  work.querySelector('#csv-cancel').onclick = () => { csvState = null; work.innerHTML = ''; };
+  work.querySelector('#csv-import').onclick = async e => {
+    const chosen = [...work.querySelectorAll('[data-row]:checked')].map(c => csvState.rows[Number(c.dataset.row)]);
+    if (!chosen.length) return toast('Marque ao menos uma linha.', 'error');
+    if (!await confirmDialog('Importar extrato', `Importar ${chosen.length} linha(s) em ${acc.name} como ${map.status.value === 'confirmada' ? 'confirmadas (alteram o saldo)' : 'pendentes (não alteram o saldo até você confirmar)'}?`)) return;
+    e.target.disabled = true;
+    try {
+      const r = await post('fin/import/csv', { account_id: acc.id, status: map.status.value, rows: chosen.map(x => ({ line: x.line, date: x.date, description: x.description, amount_cents: x.amount_cents, pending: x.pending })) });
+      csvState = null; toast(`${r.imported} importada(s); ${r.skipped} já existiam.`); await refresh();
+    } catch (err) { toast(err.message, 'error'); e.target.disabled = false; }
+  };
 }
 
 function goalForm(g, refresh) {

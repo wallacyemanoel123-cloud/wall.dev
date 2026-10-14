@@ -1,13 +1,14 @@
 // Rotas do WALL Finance (/api/fin/*). Toda movimentação nasce de uma ação explícita do titular.
 import { fail, json, readJson } from './http.js';
 import { v, newId, nowIso, getRow, create, createMany, update, remove, revision, auditStmt, bump } from './store.js';
-import { CATEGORIES, today, nextOccurrence, reconcile, findDuplicates, toCSV } from '../public/shared/finance.js';
+import { CATEGORIES, today, nextOccurrence, reconcile, findDuplicates, toCSV, accountBalance, suggestAccount } from '../public/shared/finance.js';
+import { sha256 } from './auth.js';
 
 const KINDS = ['banco', 'carteira_digital', 'especie', 'reserva', 'investimento', 'outro'];
 const all = async (db, sql, ...args) => (await db.prepare(sql).bind(...args).all()).results;
 
 export async function loadFinance(db) {
-  const [accounts, snapshots, transactions, budgets, recurring, shifts, goals, investments, settingsRows, attachments] = await Promise.all([
+  const [accounts, snapshots, transactions, budgets, recurring, shifts, goals, investments, settingsRows, attachments, reserves, planned, wishlist, investmentOps] = await Promise.all([
     all(db, 'SELECT * FROM fin_accounts ORDER BY archived, sort, created_at'),
     all(db, 'SELECT * FROM fin_snapshots ORDER BY date DESC, created_at DESC'),
     all(db, 'SELECT * FROM fin_transactions WHERE deleted_at IS NULL ORDER BY date DESC, created_at DESC'),
@@ -18,9 +19,13 @@ export async function loadFinance(db) {
     all(db, 'SELECT * FROM fin_investments ORDER BY created_at'),
     all(db, 'SELECT key, value FROM fin_settings'),
     all(db, 'SELECT id, transaction_id, filename, mime, size, extracted_json, created_at FROM fin_attachments ORDER BY created_at DESC'),
+    all(db, 'SELECT * FROM fin_reserves ORDER BY archived, created_at'),
+    all(db, 'SELECT * FROM fin_planned ORDER BY status, due_date'),
+    all(db, 'SELECT * FROM fin_wishlist ORDER BY status, sort, created_at'),
+    all(db, 'SELECT * FROM fin_investment_ops ORDER BY date DESC, created_at DESC'),
   ]);
   const settings = Object.fromEntries(settingsRows.map(r => [r.key, r.value]));
-  return { accounts, snapshots, transactions, budgets, recurring, shifts, goals, investments, settings, attachments, categories: CATEGORIES };
+  return { accounts, snapshots, transactions, budgets, recurring, shifts, goals, investments, settings, attachments, reserves, planned, wishlist, investmentOps, categories: CATEGORIES };
 }
 
 async function account(db, id) {
@@ -29,10 +34,19 @@ async function account(db, id) {
   return a;
 }
 
-// Saída de dinheiro de uma reserva exige confirmação explícita.
-function guardReserve(acc, amount, input) {
-  if (acc.is_reserve && amount < 0 && input.confirm_reserve !== true)
-    fail(428, `“${acc.name}” é uma reserva protegida. Confirme que deseja retirar dinheiro dela.`, { code: 'reserva' });
+// Saída de dinheiro protegido exige confirmação explícita: contas-reserva inteiras ou a parte
+// do saldo reservada dentro de uma conta (fin_reserves). Reservar nunca cria despesa.
+async function guardReserve(db, acc, amount, input) {
+  if (amount >= 0 || input.confirm_reserve === true) return;
+  if (acc.is_reserve) fail(428, `“${acc.name}” é uma reserva protegida. Confirme que deseja retirar dinheiro dela.`, { code: 'reserva' });
+  const reserves = await all(db, 'SELECT name, allocated_cents FROM fin_reserves WHERE account_id = ? AND archived = 0 AND allocated_cents > 0', acc.id);
+  if (!reserves.length) return;
+  const allocated = reserves.reduce((s, r) => s + r.allocated_cents, 0);
+  const [snaps, txs] = await Promise.all([all(db, 'SELECT * FROM fin_snapshots WHERE account_id = ?', acc.id), all(db, 'SELECT * FROM fin_transactions WHERE account_id = ? AND deleted_at IS NULL', acc.id)]);
+  const { balance } = accountBalance(acc, snaps, txs);
+  if (balance + amount < allocated) {
+    fail(428, `Este valor usaria dinheiro reservado em “${acc.name}” (${reserves.map(r => r.name).join(', ')}). Confirme se deseja mesmo usar a reserva.`, { code: 'reserva' });
+  }
 }
 
 function txFields(input, acc) {
@@ -72,6 +86,8 @@ export async function finRoutes(request, env, parts, url) {
       is_reserve: v.bool(i.is_reserve),
       reserve_target_cents: i.reserve_target_cents ? v.cents(i.reserve_target_cents, 'Meta da reserva') : null,
       sort: v.int(i.sort ?? 0, 'Ordem'),
+      exclude_from_budget: v.bool(i.exclude_from_budget),
+      notes: v.text(i.notes, 'Notas', { required: false, max: 1000 }),
     };
     if (i.id) return json(await update(db, 'fin_accounts', v.id(i.id), i.version, { ...fields, archived: v.bool(i.archived) }, 'conta'));
     return json(await create(db, 'fin_accounts', { ...fields, currency: v.currency(i.currency) }, 'conta'), 201);
@@ -109,11 +125,13 @@ export async function finRoutes(request, env, parts, url) {
       if (!current || current.deleted_at) fail(404, 'Transação não encontrada.');
       if (current.kind === 'transferencia') fail(400, 'Edite transferências pela tela de transferência.');
       const f = txFields(i, acc);
-      if (f.amount_cents < 0 && (acc.id !== current.account_id || f.amount_cents < current.amount_cents)) guardReserve(acc, f.amount_cents, i);
+      // Só a diferença em relação ao valor atual pode avançar sobre dinheiro reservado.
+      const delta = acc.id === current.account_id && current.status === 'confirmada' ? f.amount_cents - current.amount_cents : f.amount_cents;
+      if (delta < 0) await guardReserve(db, acc, delta, i);
       return json(await update(db, 'fin_transactions', current.id, i.version, f, 'transação', linkAttachments(db, i.attachment_ids, current.id)));
     }
     const f = txFields(i, acc);
-    guardReserve(acc, f.amount_cents, i);
+    await guardReserve(db, acc, f.amount_cents, i);
     const txId = newId();
     return json(await create(db, 'fin_transactions', { id: txId, ...f }, 'transação', linkAttachments(db, i.attachment_ids, txId)), 201);
   }
@@ -138,7 +156,7 @@ export async function finRoutes(request, env, parts, url) {
     if (from.id === to.id) fail(400, 'Escolha contas diferentes.');
     const out = v.cents(i.amount_cents, 'Valor enviado');
     const inn = from.currency === to.currency ? out : v.cents(i.amount_to_cents, `Valor recebido em ${to.currency}`);
-    guardReserve(from, -out, i);
+    await guardReserve(db, from, -out, i);
     const common = {
       kind: 'transferencia', date: v.date(i.date, 'Data'), category: 'Transferência',
       description: v.text(i.description || `Transferência ${from.name} → ${to.name}`, 'Descrição'),
@@ -181,7 +199,7 @@ export async function finRoutes(request, env, parts, url) {
     const snap = { account_id: acc.id, amount_cents: reported, date, source, status: 'confirmado', is_anchor: mode === 'ancorar' ? 1 : 0,
       note: `Conciliação: calculado ${result.computed}, diferença ${result.difference} (centavos)` };
     if (mode === 'ajustar' && result.difference !== 0) {
-      guardReserve(acc, result.difference, i);
+      await guardReserve(db, acc, result.difference, i);
       await createMany(db, 'fin_transactions', [{ account_id: acc.id, kind: 'ajuste', amount_cents: result.difference, currency: acc.currency, date,
         description: 'Ajuste de conciliação', category: 'Ajuste', status: 'confirmada', notes: 'Diferença entre saldo informado e calculado, autorizada pelo titular.' }], 'ajuste');
     }
@@ -228,7 +246,7 @@ export async function finRoutes(request, env, parts, url) {
     }
     const acc = await account(db, r.account_id);
     const amount = r.kind === 'despesa' ? -(i.amount_cents ? v.cents(i.amount_cents, 'Valor') : r.amount_cents) : (i.amount_cents ? v.cents(i.amount_cents, 'Valor') : r.amount_cents);
-    guardReserve(acc, amount, i);
+    await guardReserve(db, acc, amount, i);
     const tx = await create(db, 'fin_transactions', {
       account_id: acc.id, kind: r.kind, amount_cents: amount, currency: acc.currency, date: v.date(i.date || r.next_date, 'Data'),
       description: r.description, category: r.category, status: v.oneOf(i.status || 'confirmada', 'Status', ['confirmada', 'pendente']), recurring_id: r.id,
@@ -259,7 +277,7 @@ export async function finRoutes(request, env, parts, url) {
       const status = v.oneOf(i.status || 'confirmada', 'Status', ['confirmada', 'pendente']);
       const rows = [];
       if (f.gross_cents + f.tips_cents > 0) rows.push({ account_id: acc.id, kind: 'receita', amount_cents: f.gross_cents + f.tips_cents, currency: acc.currency, date: f.date, description: `Delivery ${f.platform}`, category: 'Delivery', status, shift_id: shiftId });
-      if (f.costs_cents > 0) { guardReserve(acc, -f.costs_cents, i); rows.push({ account_id: acc.id, kind: 'despesa', amount_cents: -f.costs_cents, currency: acc.currency, date: f.date, description: `Custos delivery ${f.platform}`, category: 'Combustível', status, shift_id: shiftId }); }
+      if (f.costs_cents > 0) { await guardReserve(db, acc, -f.costs_cents, i); rows.push({ account_id: acc.id, kind: 'despesa', amount_cents: -f.costs_cents, currency: acc.currency, date: f.date, description: `Custos delivery ${f.platform}`, category: 'Combustível', status, shift_id: shiftId }); }
       if (rows.length) await createMany(db, 'fin_transactions', rows, 'transação');
     }
     return json(shift, 201);
@@ -337,8 +355,144 @@ export async function finRoutes(request, env, parts, url) {
     const i = await body();
     const candidate = { amount_cents: v.cents(i.amount_cents, 'Valor'), date: v.date(i.date, 'Data'), currency: v.currency(i.currency), merchant: i.merchant || '' };
     const txs = await all(db, 'SELECT * FROM fin_transactions WHERE deleted_at IS NULL AND date BETWEEN ? AND ?', addDaysIso(candidate.date, -3), addDaysIso(candidate.date, 3));
-    return json({ duplicates: findDuplicates(candidate, txs) });
+    const data = await loadFinance(db);
+    return json({ duplicates: findDuplicates(candidate, txs), suggestion: suggestAccount({ ...candidate, text: String(i.text || '').slice(0, 5000) }, data.accounts, data.transactions) });
   }
+
+  // ───── reservas dentro das contas ─────
+  if (resource === 'reserves' && method === 'POST') {
+    const i = await body();
+    const acc = await account(db, i.account_id);
+    const f = {
+      name: v.text(i.name, 'Nome da reserva', { max: 80 }), account_id: acc.id,
+      target_cents: v.cents(i.target_cents, 'Meta da reserva'),
+      allocated_cents: v.cents(i.allocated_cents ?? 0, 'Valor reservado', { allowZero: true }),
+      notes: v.text(i.notes, 'Notas', { required: false, max: 1000 }), archived: v.bool(i.archived),
+    };
+    const [snaps, txs] = await Promise.all([all(db, 'SELECT * FROM fin_snapshots WHERE account_id = ?', acc.id), all(db, 'SELECT * FROM fin_transactions WHERE account_id = ? AND deleted_at IS NULL', acc.id)]);
+    const others = (await all(db, 'SELECT id, allocated_cents FROM fin_reserves WHERE account_id = ? AND archived = 0', acc.id)).filter(r => r.id !== i.id).reduce((s, r) => s + r.allocated_cents, 0);
+    const { balance } = accountBalance(acc, snaps, txs);
+    if (!f.archived && f.allocated_cents + others > Math.max(0, balance)) fail(400, `Valor reservado maior que o saldo calculado de “${acc.name}”. Reserve no máximo o que existe na conta.`);
+    return i.id ? json(await update(db, 'fin_reserves', v.id(i.id), i.version, f, 'reserva')) : json(await create(db, 'fin_reserves', f, 'reserva'), 201);
+  }
+
+  // ───── planejadas: não mexem no saldo até virarem lançamento ─────
+  if (resource === 'planned' && method === 'POST' && !action) {
+    const i = await body();
+    const acc = i.account_id ? await account(db, i.account_id) : null;
+    const f = {
+      account_id: acc?.id || null, kind: v.oneOf(i.kind || 'despesa', 'Tipo', ['receita', 'despesa']),
+      amount_cents: v.cents(i.amount_cents, 'Valor'), currency: acc ? acc.currency : v.currency(i.currency),
+      description: v.text(i.description, 'Descrição'), category: v.text(i.category || 'Outros', 'Categoria', { max: 60 }),
+      due_date: v.date(i.due_date, 'Data prevista', { required: false }), notes: v.text(i.notes, 'Notas', { required: false, max: 2000 }),
+      status: v.oneOf(i.status || 'planejada', 'Situação', ['planejada', 'cancelada', 'lancada']),
+    };
+    return i.id ? json(await update(db, 'fin_planned', v.id(i.id), i.version, f, 'planejada')) : json(await create(db, 'fin_planned', f, 'planejada'), 201);
+  }
+  if (resource === 'planned' && action === 'launch' && method === 'POST') {
+    const p = await getRow(db, 'fin_planned', v.id(id));
+    if (!p || p.status !== 'planejada') fail(404, 'Item planejado não encontrado ou já lançado.');
+    const i = await body();
+    const acc = await account(db, i.account_id || p.account_id);
+    const raw = i.amount_cents ? v.cents(i.amount_cents, 'Valor') : p.amount_cents;
+    const amount = p.kind === 'despesa' ? -raw : raw;
+    await guardReserve(db, acc, amount, i);
+    const txId = newId();
+    const tx = await create(db, 'fin_transactions', { id: txId, account_id: acc.id, kind: p.kind, amount_cents: amount, currency: acc.currency,
+      date: v.date(i.date || p.due_date || today(), 'Data'), description: p.description, category: p.category,
+      status: v.oneOf(i.status || 'confirmada', 'Status', ['confirmada', 'pendente']), notes: p.notes }, 'transação',
+      [db.prepare("UPDATE fin_planned SET status = 'lancada', transaction_id = ?, updated_at = ?, version = version + 1 WHERE id = ?").bind(txId, nowIso(), p.id)]);
+    return json(tx, 201);
+  }
+
+  // ───── lista de desejos ─────
+  if (resource === 'wishlist' && method === 'POST') {
+    const i = await body();
+    const url0 = v.text(i.url, 'Link', { required: false, max: 500 });
+    if (url0 && !/^https?:\/\//i.test(url0)) fail(400, 'Link deve começar com http:// ou https://');
+    const f = {
+      name: v.text(i.name, 'Nome', { max: 120 }), price_cents: i.price_cents ? v.cents(i.price_cents, 'Preço') : null,
+      currency: v.currency(i.currency || 'EUR'), priority: v.oneOf(i.priority || 'media', 'Prioridade', ['alta', 'media', 'baixa']),
+      url: url0, status: v.oneOf(i.status || 'desejo', 'Situação', ['desejo', 'comprado', 'descartado']),
+      notes: v.text(i.notes, 'Notas', { required: false, max: 2000 }),
+    };
+    return i.id ? json(await update(db, 'fin_wishlist', v.id(i.id), i.version, f, 'desejo')) : json(await create(db, 'fin_wishlist', f, 'desejo'), 201);
+  }
+
+  // ───── operações de investimento (registro; nada é comprado automaticamente) ─────
+  if (resource === 'investment-ops' && method === 'POST') {
+    const i = await body();
+    const inv = await getRow(db, 'fin_investments', v.id(i.investment_id, 'Investimento'));
+    if (!inv) fail(404, 'Investimento não encontrado.');
+    const f = {
+      investment_id: inv.id, date: v.date(i.date, 'Data'),
+      type: v.oneOf(i.type, 'Tipo de operação', ['compra', 'venda', 'aporte', 'resgate', 'rendimento', 'taxa']),
+      quantity_micro: v.int(i.quantity_micro ?? 0, 'Quantidade', { max: 1e15 }), total_cents: v.cents(i.total_cents, 'Valor total'),
+      notes: v.text(i.notes, 'Notas', { required: false, max: 1000 }),
+    };
+    return i.id ? json(await update(db, 'fin_investment_ops', v.id(i.id), i.version, f, 'operação')) : json(await create(db, 'fin_investment_ops', f, 'operação'), 201);
+  }
+
+  // ───── ações em lote e conciliação com comprovante ─────
+  if (resource === 'transactions' && id === 'bulk' && method === 'POST') {
+    const i = await body();
+    const ids = Array.isArray(i.ids) ? i.ids.slice(0, 500).map(x => v.id(x)) : [];
+    if (!ids.length) fail(400, 'Selecione ao menos um lançamento.');
+    const op = v.oneOf(i.action, 'Ação', ['confirmar', 'pendente', 'excluir', 'categoria']);
+    const category = op === 'categoria' ? v.text(i.category, 'Categoria', { max: 60 }) : null;
+    const rows = await all(db, `SELECT * FROM fin_transactions WHERE deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`, ...ids);
+    if (op === 'confirmar') for (const t of rows) if (t.status === 'pendente') await guardReserve(db, await account(db, t.account_id), t.amount_cents, i);
+    const at = nowIso(), stmts = [];
+    for (const t of rows) {
+      const after = op === 'excluir' ? null : { ...t, status: op === 'confirmar' ? 'confirmada' : op === 'pendente' ? 'pendente' : t.status, category: category || t.category };
+      stmts.push(op === 'excluir'
+        ? db.prepare('UPDATE fin_transactions SET deleted_at = ?, updated_at = ?, version = version + 1 WHERE id = ?').bind(at, at, t.id)
+        : db.prepare('UPDATE fin_transactions SET status = ?, category = ?, updated_at = ?, version = version + 1 WHERE id = ?').bind(after.status, after.category, at, t.id),
+      auditStmt(db, 'fin_audit', op === 'excluir' ? 'excluir' : 'editar', 'transação', t.id, t, after));
+    }
+    await db.batch([...stmts, bump(db)]);
+    return json({ ok: true, changed: rows.length });
+  }
+  if (resource === 'transactions' && action === 'reconcile' && method === 'POST') {
+    const t = await getRow(db, 'fin_transactions', v.id(id));
+    if (!t || t.deleted_at) fail(404, 'Transação não encontrada.');
+    const i = await body();
+    const at = nowIso();
+    await db.batch([db.prepare('UPDATE fin_transactions SET reconciled_at = ?, updated_at = ?, version = version + 1 WHERE id = ?').bind(at, at, t.id),
+      ...linkAttachments(db, i.attachment_ids, t.id), auditStmt(db, 'fin_audit', 'conciliar', 'transação', t.id, t, { ...t, reconciled_at: at }), bump(db)]);
+    return json({ ok: true, reconciled_at: at });
+  }
+
+  // ───── importação de extrato CSV ─────
+  if (resource === 'import' && id === 'csv' && method === 'POST') {
+    const i = await readJson(request, 1_500_000);
+    const acc = await account(db, i.account_id);
+    const status = v.oneOf(i.status || 'pendente', 'Status', ['pendente', 'confirmada']);
+    if (!Array.isArray(i.rows) || !i.rows.length || i.rows.length > 2000) fail(400, 'Envie entre 1 e 2000 linhas.');
+    const rows = [];
+    for (const r of i.rows) {
+      const amount = v.cents(r.amount_cents, `Linha ${r.line}: valor`, { allowNegative: true });
+      const date = v.date(r.date, `Linha ${r.line}: data`);
+      const description = v.text(r.description, `Linha ${r.line}: descrição`);
+      const hash = await sha256([acc.id, date, amount, description.toLowerCase()].join('|'));
+      rows.push({ account_id: acc.id, kind: amount > 0 ? 'receita' : 'despesa', amount_cents: amount, currency: acc.currency, date, description,
+        merchant: description.slice(0, 120), category: v.text(r.category || 'Outros', 'Categoria', { max: 60 }),
+        status: r.pending ? 'pendente' : status, import_hash: hash, notes: 'Importado de extrato CSV' });
+    }
+    const existing = new Set();
+    for (let k = 0; k < rows.length; k += 90) {
+      const chunk = rows.slice(k, k + 90).map(r => r.import_hash);
+      for (const r of await all(db, `SELECT import_hash FROM fin_transactions WHERE deleted_at IS NULL AND import_hash IN (${chunk.map(() => '?').join(',')})`, ...chunk)) existing.add(r.import_hash);
+    }
+    const seen = new Set();
+    const fresh = rows.filter(r => !existing.has(r.import_hash) && !seen.has(r.import_hash) && seen.add(r.import_hash));
+    for (let k = 0; k < fresh.length; k += 200) await createMany(db, 'fin_transactions', fresh.slice(k, k + 200), 'importação CSV');
+    return json({ imported: fresh.length, skipped: rows.length - fresh.length }, 201);
+  }
+
+  // ───── exclusões simples ─────
+  const SIMPLE_DELETE = { reserves: ['fin_reserves', 'reserva'], planned: ['fin_planned', 'planejada'], wishlist: ['fin_wishlist', 'desejo'], 'investment-ops': ['fin_investment_ops', 'operação'] };
+  if (method === 'DELETE' && SIMPLE_DELETE[resource]) return json(await remove(db, SIMPLE_DELETE[resource][0], v.id(id), SIMPLE_DELETE[resource][1]));
 
   // ───── exportação e auditoria ─────
   if (resource === 'export.csv' && method === 'GET') {

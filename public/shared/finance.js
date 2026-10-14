@@ -85,30 +85,82 @@ export function flows(txs, from, to, currency) {
   return { income, expense, result: income - expense };
 }
 
-export function dashboard({ accounts, snapshots, transactions, investments = [], goals = [], budgets = [], settings = {} }, date = today()) {
+export function dashboard({ accounts, snapshots, transactions, investments = [], goals = [], budgets = [], reserves = [], planned = [], investmentOps = [], settings = {} }, date = today()) {
   const rate = Number(settings.eur_brl_milli) || null;
   const list = accounts.filter(a => !a.archived).map(a => ({ ...a, ...accountBalance(a, snapshots, transactions) }));
+  const activeReserves = reserves.filter(r => !r.archived).map(r => {
+    const acc = list.find(a => a.id === r.account_id);
+    return { ...r, currency: acc?.currency || 'EUR', account_name: acc?.name || 'Conta arquivada', deficit: Math.max(0, r.target_cents - r.allocated_cents),
+      overAllocated: acc ? r.allocated_cents > Math.max(0, acc.balance) : false };
+  });
   const byCurrency = {};
+  const positions = investments.map(i => investmentPosition(i, investmentOps));
   for (const c of ['EUR', 'BRL']) {
     const acc = list.filter(a => a.currency === c);
-    const inv = investments.filter(i => i.currency === c).reduce((s, i) => s + (i.current_cents ?? i.invested_cents), 0);
+    const inv = positions.filter(i => i.currency === c).reduce((s, i) => s + i.value, 0);
     const total = acc.reduce((s, a) => s + a.balance, 0);
-    const reserve = acc.filter(a => a.is_reserve).reduce((s, a) => s + a.balance, 0);
+    const reserveAccounts = acc.filter(a => a.is_reserve).reduce((s, a) => s + a.balance, 0);
+    const allocated = activeReserves.filter(r => r.currency === c && list.some(a => a.id === r.account_id && !a.is_reserve)).reduce((s, r) => s + r.allocated_cents, 0);
+    const excluded = acc.filter(a => a.exclude_from_budget && !a.is_reserve).reduce((s, a) => s + a.balance, 0);
     const [ms, me] = periodRange('mensal', date);
-    byCurrency[c] = { total, reserve, available: total - reserve, investments: inv, net_worth: total + inv, month: flows(transactions, ms, me, c) };
+    const plannedSoon = planned.filter(p => p.status === 'planejada' && p.currency === c && p.kind === 'despesa' && (!p.due_date || p.due_date <= addDays(date, 30)))
+      .reduce((s, p) => s + p.amount_cents, 0);
+    // Disponível = saldo das contas − contas-reserva − valores reservados dentro das contas − contas fora do orçamento.
+    byCurrency[c] = { total, reserve: reserveAccounts + allocated, excluded, available: total - reserveAccounts - allocated - excluded,
+      planned30: plannedSoon, investments: inv, net_worth: total + inv, month: flows(transactions, ms, me, c) };
   }
   const netWorth = to => {
     let sum = 0;
     for (const c of ['EUR', 'BRL']) { const v = convert(byCurrency[c].net_worth, c, to, rate); if (v === null) return null; sum += v; }
     return sum;
   };
+  const budgetList = budgets.filter(b => b.active).map(b => {
+    const st = budgetStatus(b, transactions, date);
+    const avail = byCurrency[b.currency]?.available ?? 0;
+    // O orçamento só pode ser gasto se houver dinheiro livre de reservas.
+    return { ...st, usable: Math.max(0, Math.min(st.remaining, avail)), limitedByAvailability: st.remaining > avail };
+  });
   return {
-    date, rate, accounts: list, byCurrency,
+    date, rate, accounts: list, byCurrency, reserves: activeReserves, positions,
     netWorth: { EUR: netWorth('EUR'), BRL: netWorth('BRL') },
     pendingCount: transactions.filter(t => live(t) && t.status === 'pendente').length,
-    budgets: budgets.filter(b => b.active).map(b => budgetStatus(b, transactions, date)),
-    goals: goals.map(g => goalProgress(g, { accounts: list, byCurrency, rate, netWorth })),
+    budgets: budgetList,
+    goals: goals.map(g => goalProgress(g, { accounts: list, byCurrency, rate, netWorth, reserves: activeReserves })),
   };
+}
+
+// Posição de um investimento a partir das operações registradas manualmente.
+export function investmentPosition(inv, ops = []) {
+  const mine = ops.filter(o => o.investment_id === inv.id);
+  let invested = inv.invested_cents || 0, qty = 0, income = 0, fees = 0;
+  for (const o of mine) {
+    if (o.type === 'compra' || o.type === 'aporte') { invested += o.total_cents; qty += o.quantity_micro; }
+    else if (o.type === 'venda' || o.type === 'resgate') { invested -= o.total_cents; qty -= o.quantity_micro; }
+    else if (o.type === 'rendimento') income += o.total_cents;
+    else if (o.type === 'taxa') fees += o.total_cents;
+  }
+  const value = inv.current_cents ?? invested;
+  return { ...inv, invested, quantity_micro: qty, income, fees, value, result: value - invested + income - fees, ops: mine.length };
+}
+
+// Sugere a conta de origem de um comprovante (nunca decide sozinho: o titular confirma).
+export function suggestAccount({ currency, merchant, text = '' }, accounts, txs = []) {
+  const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[^a-z0-9 ]/g, '');
+  const t = norm(text), m = norm(merchant);
+  const scored = accounts.filter(a => !a.archived).map(a => {
+    let score = 0; const why = [];
+    if (currency && a.currency === currency) { score += 2; why.push('mesma moeda'); }
+    for (const word of [a.name, a.institution].map(norm).flatMap(x => x.split(' ')).filter(w => w.length >= 4)) {
+      if (t.includes(word)) { score += 5; why.push(`“${word}” aparece no comprovante`); break; }
+    }
+    if (m) {
+      const uses = txs.filter(x => !x.deleted_at && x.account_id === a.id && norm(x.merchant || x.description).includes(m)).length;
+      if (uses) { score += Math.min(3, uses); why.push(`${uses} lançamento(s) anteriores neste estabelecimento`); }
+    }
+    if (a.is_reserve || a.exclude_from_budget) score -= 3;
+    return { id: a.id, name: a.name, score, why };
+  }).sort((x, y) => y.score - x.score);
+  return scored[0] && scored[0].score > 0 ? scored[0] : null;
 }
 
 export function budgetStatus(budget, txs, date) {
@@ -122,10 +174,16 @@ export function budgetStatus(budget, txs, date) {
   return { ...budget, from, to, spent, pending, remaining: budget.limit_cents - spent, over: spent > budget.limit_cents };
 }
 
-export function goalProgress(goal, { accounts, byCurrency, rate, netWorth }) {
+export function goalProgress(goal, { accounts, byCurrency, rate, netWorth, reserves = [] }) {
   let current = goal.saved_cents || 0, note = 'Valor informado manualmente';
   if (goal.kind === 'patrimonio') { current = netWorth(goal.currency); note = current === null ? 'Informe a taxa EUR→BRL para somar moedas diferentes' : 'Patrimônio calculado (contas + investimentos)'; }
-  else if (goal.kind === 'reserva') { current = convertSum(accounts.filter(a => a.is_reserve), goal.currency, rate); note = 'Saldo das contas de reserva'; }
+  else if (goal.kind === 'reserva') {
+    const inAccounts = convertSum(accounts.filter(a => a.is_reserve), goal.currency, rate);
+    let inReserves = 0;
+    for (const r of reserves) { const v = convert(r.allocated_cents, r.currency, goal.currency, rate); if (v === null) { inReserves = null; break; } inReserves += v; }
+    current = inAccounts === null || inReserves === null ? null : inAccounts + inReserves;
+    note = 'Contas de reserva + valores reservados';
+  }
   else if (goal.kind === 'conta' && goal.account_id) { const a = accounts.find(x => x.id === goal.account_id); current = a ? convert(a.balance, a.currency, goal.currency, rate) : null; note = a ? 'Saldo da conta ' + a.name : 'Conta não encontrada'; }
   const pct = current === null || !goal.target_cents ? null : Math.max(0, Math.min(100, Math.round(current * 1000 / goal.target_cents) / 10));
   return { ...goal, current, pct, note, missing: current === null ? null : Math.max(0, goal.target_cents - current) };

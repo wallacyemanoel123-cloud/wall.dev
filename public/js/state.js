@@ -2,11 +2,12 @@
 import { api } from './api.js';
 import { dashboard } from '../shared/finance.js';
 
-export const S = { fin: null, os: [], dash: null, revision: 0, email: '', loadedAt: null };
+export const S = { fin: null, os: [], habitLogs: [], dash: null, revision: 0, email: '', loadedAt: null };
 
 export async function loadAll() {
-  const [fin, os] = await Promise.all([api('fin/state'), api('os/items')]);
-  S.fin = fin; S.os = os; S.revision = fin.revision; S.loadedAt = new Date();
+  const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const [fin, os, habitLogs] = await Promise.all([api('fin/state'), api('os/items'), api('os/habit-logs?from=' + since)]);
+  S.fin = fin; S.os = os; S.habitLogs = habitLogs; S.revision = fin.revision; S.loadedAt = new Date();
   S.dash = dashboard(fin, fin.today);
   return S;
 }

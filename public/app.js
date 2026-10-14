@@ -1,37 +1,44 @@
 // WALL Finance — inicialização, navegação e sincronização entre aparelhos.
 import { api, post } from './js/api.js';
 import { S, loadAll } from './js/state.js';
-import { icon, toast, isDialogOpen, esc } from './js/ui.js';
+import { icon, toast, isDialogOpen, esc, applyTheme } from './js/ui.js';
 import * as fin from './js/views-fin.js';
 import * as os from './js/views-os.js';
 import * as more from './js/views-more.js';
 
 const ROUTES = [
-  { group: 'Finanças' },
-  { id: 'painel', label: 'Painel', icon: 'home', view: fin.painel },
-  { id: 'lancamentos', label: 'Lançamentos', icon: 'list', view: fin.lancamentos },
-  { id: 'contas', label: 'Contas e saldos', icon: 'wallet', view: fin.contas },
-  { id: 'recibos', label: 'Recibos', icon: 'receipt', view: fin.recibos },
-  { id: 'orcamentos', label: 'Orçamentos', icon: 'pie', view: fin.orcamentos },
-  { id: 'recorrentes', label: 'Fixas e recorrentes', icon: 'repeat', view: fin.recorrentes },
-  { id: 'delivery', label: 'Delivery', icon: 'bike', view: fin.delivery },
-  { id: 'metas', label: 'Metas e investimentos', icon: 'target', view: fin.metas },
-  { id: 'relatorios', label: 'Relatórios', icon: 'chart', view: fin.relatorios },
   { group: 'WALL OS' },
   { id: 'hoje', label: 'Hoje', icon: 'sun', view: os.hoje },
-  { id: 'objetivos', label: 'Objetivos e projetos', icon: 'flag', view: os.objetivos },
   { id: 'planejamento', label: 'Planejamento', icon: 'list', view: os.planejamento },
-  { id: 'diario', label: 'Diário', icon: 'book', view: os.diario },
+  { id: 'objetivos', label: 'Metas e objetivos', icon: 'flag', view: os.objetivos },
+  { id: 'projetos', label: 'Projetos e negócios', icon: 'briefcase', view: os.projetos },
   { id: 'calendario', label: 'Calendário', icon: 'calendar', view: os.calendario },
+  { id: 'diario', label: 'Diário', icon: 'book', view: os.diario },
+  { id: 'checklist', label: 'Checklist diário', icon: 'check', view: os.checklist },
+  { id: 'habitos', label: 'Hábitos e saúde', icon: 'heart', view: os.habitos },
+  { id: 'ingles', label: 'Estudos de inglês', icon: 'globe', view: os.ingles },
+  { group: 'WALL Finance' },
+  { id: 'painel', label: 'Visão financeira', icon: 'home', view: fin.painel },
+  { id: 'lancamentos', label: 'Lançamentos', icon: 'list', view: fin.lancamentos },
+  { id: 'contas', label: 'Contas e reservas', icon: 'wallet', view: fin.contas },
+  { id: 'recibos', label: 'Recibos', icon: 'receipt', view: fin.recibos },
+  { id: 'extrato', label: 'Importar extrato', icon: 'upload', view: fin.extrato },
+  { id: 'orcamentos', label: 'Orçamentos', icon: 'pie', view: fin.orcamentos },
+  { id: 'recorrentes', label: 'Fixas e planejadas', icon: 'repeat', view: fin.recorrentes },
+  { id: 'delivery', label: 'Delivery', icon: 'bike', view: fin.delivery },
+  { id: 'investimentos', label: 'Investimentos', icon: 'chart', view: fin.investimentos },
+  { id: 'metas', label: 'Metas financeiras', icon: 'target', view: fin.metas },
+  { id: 'desejos', label: 'Lista de desejos', icon: 'star', view: fin.desejos },
+  { id: 'relatorios', label: 'Relatórios', icon: 'chart', view: fin.relatorios },
   { group: 'Sistema' },
-  { id: 'assistente', label: 'Assistente', icon: 'spark', view: more.assistente },
+  { id: 'assistente', label: 'Assistente WALL', icon: 'spark', view: more.assistente },
   { id: 'dados', label: 'Dados e segurança', icon: 'shield', view: more.dados },
 ];
 const pages = ROUTES.filter(r => r.id);
 const $ = s => document.querySelector(s);
 
 function currentRoute() {
-  const id = location.hash.replace(/^#\/?/, '').split('?')[0] || 'painel';
+  const id = location.hash.replace(/^#\/?/, '').split('?')[0] || 'hoje';
   return pages.find(p => p.id === id) || pages[0];
 }
 
@@ -39,7 +46,7 @@ function renderNav(active) {
   $('#nav').innerHTML = ROUTES.map(r => r.group ? `<div class="nav-group eyebrow">${esc(r.group)}</div>`
     : `<a href="#/${r.id}"${r.id === active.id ? ' aria-current="page"' : ''}>${icon(r.icon)}${esc(r.label)}</a>`).join('');
   const tab = (id, label, ic) => `<a href="#/${id}"${id === active.id ? ' aria-current="page"' : ''}>${icon(ic)}${label}</a>`;
-  $('#tabbar').innerHTML = tab('painel', 'Painel', 'home') + tab('lancamentos', 'Lançamentos', 'list')
+  $('#tabbar').innerHTML = tab('hoje', 'Hoje', 'sun') + tab('painel', 'Finanças', 'wallet')
     + `<button type="button" class="fab" data-quick aria-label="Novo lançamento">${icon('plus')}Lançar</button>`
     + tab('recibos', 'Recibo', 'camera') + `<button type="button" data-more aria-label="Mais opções">${icon('more')}Mais</button>`;
 }
@@ -48,7 +55,7 @@ export async function render() {
   const route = currentRoute();
   renderNav(route);
   $('#page-title').textContent = route.label;
-  document.title = `${route.label} · WALL Finance`;
+  document.title = `${route.label} · WALL OS`;
   const host = $('#view');
   try { await route.view(host, { rerender: render, refresh }); }
   catch (e) { host.innerHTML = `<div class="banner error">Não foi possível exibir esta tela: ${esc(e.message)}</div>`; console.error(e); }
@@ -86,6 +93,8 @@ function showMoreMenu() {
 }
 
 async function start() {
+  applyTheme();
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme());
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   document.addEventListener('click', e => {
     if (e.target.closest('[data-quick]') || e.target.closest('#quick-add')) fin.quickAdd(refresh);

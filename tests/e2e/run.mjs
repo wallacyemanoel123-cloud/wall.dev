@@ -81,7 +81,7 @@ await step('Senha errada é recusada; senha certa entra (notebook)', async () =>
   await P.locator('#login-error', { hasText: 'incorretos' }).waitFor();
   await snap(P, 'login.png');
   await login(P);
-  assert.equal(await P.locator('#page-title').innerText(), 'Painel');
+  assert.equal(await P.locator('#page-title').innerText(), 'Hoje', 'WALL OS abre em Hoje');
 });
 
 await step('Cria contas com saldo de referência e reserva protegida', async () => {
@@ -146,7 +146,7 @@ await step('Recibo: extrai dados, alerta duplicidade e só registra após confir
   await P.locator('#parse-text').click();
   await P.locator('#dialog .banner.warn', { hasText: 'Possível duplicidade' }).waitFor();
   assert.equal(await P.locator('#dialog [name="amount"]').inputValue(), '30,00');
-  assert.equal(await P.locator('#dialog [name="date"]').inputValue(), '2026-10-05');
+  assert.equal(await P.locator('#dialog [name="date"]').inputValue(), '05/10/2026');
   await snap(P, 'recibo.png');
   const before = (await P.evaluate(() => fetch('/api/fin/state').then(r => r.json()))).transactions.length;
   await P.locator('#dialog [data-close]').first().click();
@@ -164,7 +164,7 @@ await step('Recibo por foto: OCR no aparelho preenche valor, data e estabelecime
   await P.locator('#receipt-file').setInputFiles({ name: 'padaria.png', mimeType: 'image/png', buffer: png });
   await P.locator('#dialog[open]').waitFor({ timeout: 90000 });
   assert.equal(await P.locator('#dialog [name="amount"]').inputValue(), '4,20');
-  assert.equal(await P.locator('#dialog [name="date"]').inputValue(), '2026-10-07');
+  assert.equal(await P.locator('#dialog [name="date"]').inputValue(), '07/10/2026');
   assert.match(await P.locator('#dialog [name="merchant"]').inputValue(), /PADARIA CENTRAL/i);
   await snap(P, 'recibo-ocr.png');
   await P.locator('#dialog [data-close]').first().click();
@@ -315,8 +315,8 @@ await step('Assistente: análise por regras sem IA externa', async () => {
   await P.goto(BASE + '/#/assistente');
   await P.locator('.insight').first().waitFor();
   await P.locator('#ask textarea').fill('Como estão minhas metas?');
-  await P.locator('#ask button').click();
-  await P.locator('.bubble:not(.me)', { hasText: 'não configurada' }).waitFor();
+  await P.locator('#ask button.primary').click();
+  await P.locator('.bubble:not(.me)', { hasText: 'Regras sobre' }).waitFor(); // respondida pelas regras, sem IA
 });
 
 await step('PWA: manifesto, ícones e service worker', async () => {
@@ -327,6 +327,184 @@ await step('PWA: manifesto, ícones e service worker', async () => {
   assert.equal(await P.evaluate(async () => !!(await navigator.serviceWorker.ready).active), true);
   const head = await fetch(BASE + '/');
   assert.match(head.headers.get('content-security-policy') || '', /default-src 'self'/);
+});
+
+
+const api = (page, path, body, method) => page.evaluate(async ([p, b, m]) => {
+  const r = await fetch('/api/' + p, { method: m || (b === undefined ? 'GET' : 'POST'), headers: b === undefined ? {} : { 'Content-Type': 'application/json' }, body: b === undefined ? undefined : JSON.stringify(b) });
+  return { status: r.status, body: await r.json().catch(() => null) };
+}, [path, body, method]);
+const accId = async (page, name) => (await api(page, 'fin/state')).body.accounts.find(a => a.name === name).id;
+
+await step('Reserva dentro da conta: tira do disponível, não vira despesa e protege o saldo', async () => {
+  await P.goto(BASE + '/#/contas');
+  await P.locator('[data-act="reserve"]').click();
+  await fill(P, 'name', 'Moradia teste'); await select(P, 'account_id', { label: 'Carteira Teste EUR (EUR)' });
+  await fill(P, 'target', '800,00'); await fill(P, 'allocated', '600,00');
+  await save(P);
+  await P.locator('text=/Déficit: €\\s200,00/').waitFor();
+  const st = (await api(P, 'fin/state')).body;
+  assert.equal(st.transactions.filter(t => t.description.includes('Moradia')).length, 0, 'reservar não cria lançamento');
+  const acc = st.accounts.find(a => a.name === 'Carteira Teste EUR').id;
+  // Saldo 697 (após a recorrência “Internet”) − reservado 600 = 97 livres. Gastar 120 avança sobre a reserva → 428.
+  const r1 = await api(P, 'fin/transactions', { account_id: acc, kind: 'despesa', amount_cents: 12000, date: '2026-10-10', description: 'Gasto grande' });
+  assert.equal(r1.status, 428);
+  const r2 = await api(P, 'fin/transactions', { account_id: acc, kind: 'despesa', amount_cents: 4000, date: '2026-10-10', description: 'Gasto ok' });
+  assert.equal(r2.status, 201);
+  const big = await api(P, 'fin/reserves', { name: 'Excesso', account_id: acc, target_cents: 100000, allocated_cents: 100000 });
+  assert.equal(big.status, 400, 'não reserva mais do que existe na conta');
+});
+
+await step('Planejada fica fora do saldo até ser lançada', async () => {
+  const acc = await accId(P, 'Carteira Teste EUR');
+  const before = (await api(P, 'fin/state')).body.transactions.length;
+  const p = await api(P, 'fin/planned', { kind: 'despesa', amount_cents: 500, description: 'Passagem planejada', account_id: acc, due_date: '2026-10-20' });
+  assert.equal(p.status, 201);
+  assert.equal((await api(P, 'fin/state')).body.transactions.length, before);
+  await P.goto(BASE + '/#/recorrentes'); await P.reload();
+  await P.locator('[data-plan-launch]').first().click();
+  await save(P);
+  const st = (await api(P, 'fin/state')).body;
+  assert.equal(st.transactions.length, before + 1);
+  assert.equal(st.planned.find(x => x.id === p.body.id).status, 'lancada');
+});
+
+await step('Importação de extrato CSV: preview, duplicados e reimportação sem duplicar', async () => {
+  const csv = 'Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance\n'
+    + 'CARD_PAYMENT,Current,2026-10-11 10:00:00,2026-10-11 10:05:00,Padaria do bairro,-3.10,0.00,EUR,COMPLETED,1\n'
+    + 'TRANSFER,Current,2026-10-12 10:00:00,2026-10-12 10:00:00,Pagamento recebido,25.00,0.00,EUR,COMPLETED,1\n'
+    + 'CARD_PAYMENT,Current,2026-10-12 11:00:00,2026-10-12 11:00:00,Estornado,-9.00,0.00,EUR,REVERTED,1\n';
+  await P.goto(BASE + '/#/extrato');
+  await P.locator('#csv-file').setInputFiles({ name: 'revolut.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await P.locator('text=Formato detectado').waitFor();
+  await P.locator('#csv-map [name="account"]').selectOption({ label: 'Carteira Teste EUR (EUR)' });
+  await P.locator('[data-row]').first().waitFor();
+  assert.equal(await P.locator('[data-row]').count(), 2, 'linha estornada ignorada');
+  await P.locator('#csv-import').click();
+  await P.locator('dialog:not(#dialog) button[value="yes"]').click();
+  await P.locator('#toast', { hasText: '2 importada' }).waitFor();
+  const acc = await accId(P, 'Carteira Teste EUR');
+  const again = await api(P, 'fin/import/csv', { account_id: acc, rows: [{ line: 2, date: '2026-10-11', description: 'Padaria do bairro', amount_cents: -310 }] });
+  assert.deepEqual(again.body, { imported: 0, skipped: 1 });
+  const st = (await api(P, 'fin/state')).body;
+  assert.ok(st.transactions.filter(t => t.import_hash).every(t => t.status === 'pendente'), 'importadas como pendentes não mexem no saldo');
+});
+
+await step('Lançamentos em lote: classificar e confirmar', async () => {
+  await P.goto(BASE + '/#/lancamentos'); await P.reload();
+  await P.locator('#filters [name="status"]').selectOption('pendente');
+  await P.locator('[data-act="select"]').click();
+  await P.locator('#sel-all').check();
+  await P.locator('[data-bulk="categoria"]').click();
+  await fill(P, 'category', 'Mercado'); await save(P);
+  await P.locator('#toast', { hasText: 'atualizados' }).waitFor();
+  const st = (await api(P, 'fin/state')).body;
+  assert.ok(st.transactions.filter(t => t.import_hash).every(t => t.category === 'Mercado'));
+});
+
+await step('Investimentos: operações registradas sem criar lançamentos', async () => {
+  const before = (await api(P, 'fin/state')).body.transactions.length;
+  const inv = await api(P, 'fin/investments', { name: 'ETF teste', kind: 'ETFs', currency: 'EUR', invested_cents: 0 });
+  assert.equal((await api(P, 'fin/investment-ops', { investment_id: inv.body.id, type: 'compra', date: '2026-10-10', total_cents: 10000, quantity_micro: 2000000 })).status, 201);
+  const st = (await api(P, 'fin/state')).body;
+  assert.equal(st.transactions.length, before);
+  await P.goto(BASE + '/#/investimentos'); await P.reload();
+  await P.locator('text=ETF teste').waitFor();
+});
+
+await step('Lista de desejos: criar e reordenar', async () => {
+  for (const name of ['Fone', 'Tênis']) assert.equal((await api(P, 'fin/wishlist', { name, price_cents: 5000, currency: 'EUR' })).status, 201);
+  await P.goto(BASE + '/#/desejos'); await P.reload();
+  await P.locator('[data-down="0"]').click();
+  await P.waitForFunction(() => document.querySelector('#wish .row .title')?.textContent.includes('Tênis'));
+});
+
+await step('WALL OS: hábitos, inglês, metas por prazo, projeto, arquivar e reordenar', async () => {
+  await M.goto(BASE + '/#/habitos'); await M.reload();
+  await M.locator('[data-preset="agua"]').click(); await save(M);
+  await M.locator('[data-habit] [name="value"]').first().fill('8');
+  await M.locator('[data-habit] button').first().click();
+  await M.locator('#toast', { hasText: 'Registrado' }).waitFor();
+  const logs = (await api(M, 'os/habit-logs?from=2000-01-01')).body;
+  assert.equal(logs[0].value, 8);
+  await M.goto(BASE + '/#/ingles');
+  await M.locator('[data-new]').click(); await fill(M, 'title', 'Phrasal verbs'); await fill(M, 'minutes', '25'); await save(M);
+  await M.locator('text=/25 min/').first().waitFor();
+  await M.goto(BASE + '/#/objetivos');
+  for (const [h, t] of [['curto', 'Completar reserva'], ['longo', 'Comprar casa']]) { await M.locator(`[data-new-h="${h}"]`).click(); await fill(M, 'title', t); await save(M); }
+  await M.locator('[data-h="longo"]', { hasText: 'Comprar casa' }).waitFor();
+  await M.goto(BASE + '/#/projetos');
+  await M.locator('[data-new]').click(); await fill(M, 'title', 'Projeto teste'); await fill(M, 'next', 'Publicar'); await save(M);
+  await M.locator('#biz [data-archive]').first().click();
+  await M.locator('#toast', { hasText: 'Arquivado' }).waitFor();
+  const items = (await api(M, 'os/items')).body;
+  assert.equal(items.find(i => i.title === 'Projeto teste').archived, 1);
+  assert.equal(items.find(i => i.title === 'Comprar casa').horizon, 'longo');
+  await M.goto(BASE + '/#/hoje'); await snap(M, 'celular-hoje.png');
+});
+
+await step('Assistente responde as 7 perguntas pelas regras, sem IA externa', async () => {
+  const qs = ['Quanto tenho disponível hoje?', 'Quanto ainda falta para completar minha reserva?', 'Quais contas vencem nesta semana?', 'Quanto ganhei trabalhando com delivery?',
+    'Quanto economizei neste mês?', 'Quais tarefas ainda tenho hoje?', 'Qual é o progresso das minhas metas?'];
+  for (const q of qs) { const r = (await api(P, 'assistant/ask', { question: q })).body; assert.equal(r.modo, 'regras', q); assert.ok(r.resposta && r.resposta.length > 10, q); }
+  const fall = (await api(P, 'assistant/ask', { question: 'previsão do tempo amanhã' })).body;
+  assert.equal(fall.resposta, null); assert.ok(fall.sugestoes.length >= 7);
+  await P.goto(BASE + '/#/assistente');
+  await P.locator('[data-q]').first().click();
+  await P.locator('.bubble:not(.me)', { hasText: 'livres' }).waitFor();
+});
+
+await step('Recibo duplicado pode ser conciliado com o lançamento existente (sem lançar de novo)', async () => {
+  const before = (await api(P, 'fin/state')).body.transactions.length;
+  await P.goto(BASE + '/#/recibos'); await P.reload();
+  await P.locator('#receipt-text').fill('PADARIA DO BAIRRO\nTOTAL € 3,10\n11/10/2026');
+  await P.locator('#parse-text').click();
+  await P.locator('#dialog [data-reconcile]').first().click();
+  await P.locator('#toast', { hasText: 'conciliado' }).waitFor();
+  const st = (await api(P, 'fin/state')).body;
+  assert.equal(st.transactions.length, before);
+  assert.ok(st.transactions.some(t => t.reconciled_at));
+});
+
+await step('Interface: modo escuro e datas em português', async () => {
+  await P.emulateMedia({ colorScheme: 'dark' });
+  await P.goto(BASE + '/#/painel'); await P.reload();
+  const bg = await P.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  assert.equal(bg, 'rgb(13, 17, 22)');
+  await snap(P, 'notebook-escuro.png');
+  await P.emulateMedia({ colorScheme: 'light' });
+  await P.locator('#quick-add').click();
+  assert.equal(await P.locator('#dialog [name="date"]').getAttribute('placeholder'), 'dd/mm/aaaa');
+  await fill(P, 'date', '31/02/2026'); await fill(P, 'amount', '1,00'); await fill(P, 'description', 'x');
+  await P.locator('#dialog button[type="submit"]').click();
+  await P.locator('#dialog .form-error', { hasText: 'data inválida' }).waitFor();
+  await P.locator('#dialog [data-close]').first().click();
+  assert.equal(await P.locator('input[type="date"], input[type="time"], input[type="number"]').count(), 0, 'sem controles nativos com texto em inglês');
+});
+
+await step('Restauração do backup em um banco limpo', async () => {
+  const backup = await P.evaluate(() => fetch('/api/backup?anexos=1').then(r => r.json()));
+  const persist2 = mkdtempSync(join(tmpdir(), 'wf-e2e-clean-'));
+  execFileSync(wrangler, ['d1', 'migrations', 'apply', 'wall-finance', '--local', '--persist-to', persist2], { cwd: root, stdio: 'ignore', env: { ...process.env, CI: '1' } });
+  const PORT2 = 8798, srv2 = spawn(wrangler, ['pages', 'dev', 'public', '--port', String(PORT2), '--persist-to', persist2, '--binding', `OWNER_EMAIL=${EMAIL}`, '--binding', `OWNER_PASSWORD_HASH=${hash}`], { cwd: root, env: { ...process.env, CI: '1' }, stdio: 'ignore' });
+  try {
+    for (let i = 0; i < 60; i++) { try { if ((await fetch(`http://localhost:${PORT2}/api/health`)).ok) break; } catch { /* aguardando */ } await new Promise(r => setTimeout(r, 500)); }
+    const ctx = await browser.newContext(); const page = await ctx.newPage();
+    await page.goto(`http://localhost:${PORT2}/`);
+    await page.locator('#login-form [name="email"]').fill(EMAIL); await page.locator('#login-form [name="password"]').fill(PASSWORD);
+    await page.locator('#login-form button').click(); await page.locator('#app').waitFor();
+    const empty = (await api(page, 'fin/state')).body;
+    assert.equal(empty.accounts.length, 0, 'banco limpo');
+    const r = await api(page, 'restore', { backup, confirm: 'RESTAURAR' });
+    assert.equal(r.status, 200);
+    const st = (await api(page, 'fin/state')).body, os = (await api(page, 'os/items')).body;
+    assert.equal(st.accounts.length, backup.tables.fin_accounts.length);
+    assert.equal(st.transactions.length, backup.tables.fin_transactions.filter(t => !t.deleted_at).length);
+    assert.equal(st.reserves.length, backup.tables.fin_reserves.length);
+    assert.equal(os.length, backup.tables.os_items.filter(i => !i.deleted_at).length);
+    assert.equal(st.attachments.length, backup.tables.fin_attachments.length);
+    await ctx.close();
+  } finally { srv2.kill(); }
 });
 
 await step('Configuração inicial por JSON cria contas, fotografias “a confirmar” e metas', async () => {
