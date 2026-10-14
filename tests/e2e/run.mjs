@@ -471,6 +471,7 @@ await step('Interface: modo escuro e datas em português', async () => {
   await P.goto(BASE + '/#/painel'); await P.reload();
   const bg = await P.evaluate(() => getComputedStyle(document.body).backgroundColor);
   assert.equal(bg, 'rgb(13, 17, 22)');
+  await P.locator('.page-head h1').waitFor(); await P.waitForTimeout(300);
   await snap(P, 'notebook-escuro.png');
   await P.emulateMedia({ colorScheme: 'light' });
   await P.locator('#quick-add').click();
