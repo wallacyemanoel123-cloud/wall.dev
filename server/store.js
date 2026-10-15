@@ -58,6 +58,10 @@ export async function getRow(db, table, id) {
   return db.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
 }
 
+// Falha (e desfaz a gravação inteira do batch) se a revisão mudou desde `rev`.
+export const revisionCheck = (db, rev) => db.prepare('INSERT INTO sys_revision (id, value) SELECT 1, 0 WHERE (SELECT value FROM sys_revision WHERE id = 1) <> ?').bind(rev);
+export const isRevisionConflict = e => /UNIQUE constraint failed: sys_revision/.test(String(e?.message) + String(e?.cause?.message));
+
 export async function revision(db) {
   return (await db.prepare('SELECT value FROM sys_revision WHERE id = 1').first()).value;
 }

@@ -1,6 +1,6 @@
 // Rotas do WALL Finance (/api/fin/*). Toda movimentação nasce de uma ação explícita do titular.
 import { fail, json, readJson } from './http.js';
-import { v, newId, nowIso, getRow, create, createMany, update, remove, revision, auditStmt, bump } from './store.js';
+import { v, newId, nowIso, getRow, create, createMany, update, remove, revision, revisionCheck, auditStmt, bump } from './store.js';
 import { CATEGORIES, today, nextOccurrence, reconcile, findDuplicates, toCSV, accountBalance, suggestAccount } from '../public/shared/finance.js';
 import { sha256 } from './auth.js';
 
@@ -36,17 +36,22 @@ async function account(db, id) {
 
 // Saída de dinheiro protegido exige confirmação explícita: contas-reserva inteiras ou a parte
 // do saldo reservada dentro de uma conta (fin_reserves). Reservar nunca cria despesa.
+// `amount` é o efeito TOTAL da operação na conta (lotes e importações somam todas as linhas).
+// Devolve instruções para a mesma gravação: se outra gravação acontecer entre esta verificação
+// e a escrita (ex.: celular e notebook ao mesmo tempo), a gravação inteira é desfeita com 409.
 async function guardReserve(db, acc, amount, input) {
-  if (amount >= 0 || input.confirm_reserve === true) return;
+  if (amount >= 0 || input.confirm_reserve === true) return [];
   if (acc.is_reserve) fail(428, `“${acc.name}” é uma reserva protegida. Confirme que deseja retirar dinheiro dela.`, { code: 'reserva' });
+  const rev = await revision(db);
   const reserves = await all(db, 'SELECT name, allocated_cents FROM fin_reserves WHERE account_id = ? AND archived = 0 AND allocated_cents > 0', acc.id);
-  if (!reserves.length) return;
+  if (!reserves.length) return [];
   const allocated = reserves.reduce((s, r) => s + r.allocated_cents, 0);
   const [snaps, txs] = await Promise.all([all(db, 'SELECT * FROM fin_snapshots WHERE account_id = ?', acc.id), all(db, 'SELECT * FROM fin_transactions WHERE account_id = ? AND deleted_at IS NULL', acc.id)]);
   const { balance } = accountBalance(acc, snaps, txs);
   if (balance + amount < allocated) {
     fail(428, `Este valor usaria dinheiro reservado em “${acc.name}” (${reserves.map(r => r.name).join(', ')}). Confirme se deseja mesmo usar a reserva.`, { code: 'reserva' });
   }
+  return [revisionCheck(db, rev)];
 }
 
 function txFields(input, acc) {
@@ -127,17 +132,20 @@ export async function finRoutes(request, env, parts, url) {
       const f = txFields(i, acc);
       // Só a diferença em relação ao valor atual pode avançar sobre dinheiro reservado.
       const delta = acc.id === current.account_id && current.status === 'confirmada' ? f.amount_cents - current.amount_cents : f.amount_cents;
-      if (delta < 0) await guardReserve(db, acc, delta, i);
-      return json(await update(db, 'fin_transactions', current.id, i.version, f, 'transação', linkAttachments(db, i.attachment_ids, current.id)));
+      const g = delta < 0 ? await guardReserve(db, acc, delta, i) : [];
+      return json(await update(db, 'fin_transactions', current.id, i.version, f, 'transação', [...linkAttachments(db, i.attachment_ids, current.id), ...g]));
     }
     const f = txFields(i, acc);
-    await guardReserve(db, acc, f.amount_cents, i);
+    const g = await guardReserve(db, acc, f.amount_cents, i);
     const txId = newId();
-    return json(await create(db, 'fin_transactions', { id: txId, ...f }, 'transação', linkAttachments(db, i.attachment_ids, txId)), 201);
+    return json(await create(db, 'fin_transactions', { id: txId, ...f }, 'transação', [...linkAttachments(db, i.attachment_ids, txId), ...g]), 201);
   }
   if (resource === 'transactions' && method === 'DELETE') {
     const t = await getRow(db, 'fin_transactions', v.id(id));
     if (!t || t.deleted_at) fail(404, 'Transação não encontrada.');
+    // Excluir uma entrada confirmada tira dinheiro do saldo: vale a mesma proteção da reserva.
+    const g = !t.transfer_id && t.status === 'confirmada' && t.amount_cents > 0
+      ? await guardReserve(db, await account(db, t.account_id), -t.amount_cents, { confirm_reserve: url.searchParams.get('confirm_reserve') === '1' }) : [];
     if (t.transfer_id) {
       const legs = await all(db, 'SELECT * FROM fin_transactions WHERE transfer_id = ? AND deleted_at IS NULL', t.transfer_id);
       const at = nowIso();
@@ -146,7 +154,7 @@ export async function finRoutes(request, env, parts, url) {
         auditStmt(db, 'fin_audit', 'excluir', 'transferência', l.id, l, null)]), bump(db)]);
       return json({ ok: true, removed: legs.length });
     }
-    return json(await remove(db, 'fin_transactions', t.id, 'transação', { soft: true }));
+    return json(await remove(db, 'fin_transactions', t.id, 'transação', { soft: true, extra: g }));
   }
 
   // ───── transferências: duas pernas ligadas, fora de receitas/despesas ─────
@@ -156,7 +164,7 @@ export async function finRoutes(request, env, parts, url) {
     if (from.id === to.id) fail(400, 'Escolha contas diferentes.');
     const out = v.cents(i.amount_cents, 'Valor enviado');
     const inn = from.currency === to.currency ? out : v.cents(i.amount_to_cents, `Valor recebido em ${to.currency}`);
-    await guardReserve(db, from, -out, i);
+    const g = await guardReserve(db, from, -out, i);
     const common = {
       kind: 'transferencia', date: v.date(i.date, 'Data'), category: 'Transferência',
       description: v.text(i.description || `Transferência ${from.name} → ${to.name}`, 'Descrição'),
@@ -174,14 +182,14 @@ export async function finRoutes(request, env, parts, url) {
           .bind(after.account_id, after.currency, after.amount_cents, after.date, after.description, after.status, after.notes, at, l.id),
         auditStmt(db, 'fin_audit', 'editar', 'transferência', l.id, l, { ...l, ...after }));
       }
-      await db.batch([...stmts, bump(db)]);
+      await db.batch([...stmts, ...g, bump(db)]);
       return json({ ok: true, transfer_id: i.transfer_id });
     }
     const transfer_id = newId();
     const legs = await createMany(db, 'fin_transactions', [
       { ...common, transfer_id, account_id: from.id, currency: from.currency, amount_cents: -out },
       { ...common, transfer_id, account_id: to.id, currency: to.currency, amount_cents: inn },
-    ], 'transferência');
+    ], 'transferência', g);
     return json({ transfer_id, legs }, 201);
   }
 
@@ -199,9 +207,9 @@ export async function finRoutes(request, env, parts, url) {
     const snap = { account_id: acc.id, amount_cents: reported, date, source, status: 'confirmado', is_anchor: mode === 'ancorar' ? 1 : 0,
       note: `Conciliação: calculado ${result.computed}, diferença ${result.difference} (centavos)` };
     if (mode === 'ajustar' && result.difference !== 0) {
-      await guardReserve(db, acc, result.difference, i);
+      const g = await guardReserve(db, acc, result.difference, i);
       await createMany(db, 'fin_transactions', [{ account_id: acc.id, kind: 'ajuste', amount_cents: result.difference, currency: acc.currency, date,
-        description: 'Ajuste de conciliação', category: 'Ajuste', status: 'confirmada', notes: 'Diferença entre saldo informado e calculado, autorizada pelo titular.' }], 'ajuste');
+        description: 'Ajuste de conciliação', category: 'Ajuste', status: 'confirmada', notes: 'Diferença entre saldo informado e calculado, autorizada pelo titular.' }], 'ajuste', g);
     }
     await create(db, 'fin_snapshots', snap, 'conciliação');
     return json({ ...result, mode });
@@ -246,11 +254,11 @@ export async function finRoutes(request, env, parts, url) {
     }
     const acc = await account(db, r.account_id);
     const amount = r.kind === 'despesa' ? -(i.amount_cents ? v.cents(i.amount_cents, 'Valor') : r.amount_cents) : (i.amount_cents ? v.cents(i.amount_cents, 'Valor') : r.amount_cents);
-    await guardReserve(db, acc, amount, i);
+    const g = await guardReserve(db, acc, amount, i);
     const tx = await create(db, 'fin_transactions', {
       account_id: acc.id, kind: r.kind, amount_cents: amount, currency: acc.currency, date: v.date(i.date || r.next_date, 'Data'),
       description: r.description, category: r.category, status: v.oneOf(i.status || 'confirmada', 'Status', ['confirmada', 'pendente']), recurring_id: r.id,
-    }, 'transação', [advance]);
+    }, 'transação', [advance, ...g]);
     return json({ transaction: tx, next_date: next }, 201);
   }
   if (resource === 'recurring' && method === 'DELETE') return json(await remove(db, 'fin_recurring', v.id(id), 'recorrência'));
@@ -275,10 +283,10 @@ export async function finRoutes(request, env, parts, url) {
     if (i.register === true) {
       if (!acc) fail(400, 'Escolha a conta onde o dinheiro entrou.');
       const status = v.oneOf(i.status || 'confirmada', 'Status', ['confirmada', 'pendente']);
-      const rows = [];
+      const rows = []; let g = [];
       if (f.gross_cents + f.tips_cents > 0) rows.push({ account_id: acc.id, kind: 'receita', amount_cents: f.gross_cents + f.tips_cents, currency: acc.currency, date: f.date, description: `Delivery ${f.platform}`, category: 'Delivery', status, shift_id: shiftId });
-      if (f.costs_cents > 0) { await guardReserve(db, acc, -f.costs_cents, i); rows.push({ account_id: acc.id, kind: 'despesa', amount_cents: -f.costs_cents, currency: acc.currency, date: f.date, description: `Custos delivery ${f.platform}`, category: 'Combustível', status, shift_id: shiftId }); }
-      if (rows.length) await createMany(db, 'fin_transactions', rows, 'transação');
+      if (f.costs_cents > 0) { g = await guardReserve(db, acc, -f.costs_cents, i); rows.push({ account_id: acc.id, kind: 'despesa', amount_cents: -f.costs_cents, currency: acc.currency, date: f.date, description: `Custos delivery ${f.platform}`, category: 'Combustível', status, shift_id: shiftId }); }
+      if (rows.length) await createMany(db, 'fin_transactions', rows, 'transação', g);
     }
     return json(shift, 201);
   }
@@ -396,12 +404,12 @@ export async function finRoutes(request, env, parts, url) {
     const acc = await account(db, i.account_id || p.account_id);
     const raw = i.amount_cents ? v.cents(i.amount_cents, 'Valor') : p.amount_cents;
     const amount = p.kind === 'despesa' ? -raw : raw;
-    await guardReserve(db, acc, amount, i);
+    const g = await guardReserve(db, acc, amount, i);
     const txId = newId();
     const tx = await create(db, 'fin_transactions', { id: txId, account_id: acc.id, kind: p.kind, amount_cents: amount, currency: acc.currency,
       date: v.date(i.date || p.due_date || today(), 'Data'), description: p.description, category: p.category,
       status: v.oneOf(i.status || 'confirmada', 'Status', ['confirmada', 'pendente']), notes: p.notes }, 'transação',
-      [db.prepare("UPDATE fin_planned SET status = 'lancada', transaction_id = ?, updated_at = ?, version = version + 1 WHERE id = ?").bind(txId, nowIso(), p.id)]);
+      [db.prepare("UPDATE fin_planned SET status = 'lancada', transaction_id = ?, updated_at = ?, version = version + 1 WHERE id = ?").bind(txId, nowIso(), p.id), ...g]);
     return json(tx, 201);
   }
 
@@ -441,8 +449,18 @@ export async function finRoutes(request, env, parts, url) {
     const op = v.oneOf(i.action, 'Ação', ['confirmar', 'pendente', 'excluir', 'categoria']);
     const category = op === 'categoria' ? v.text(i.category, 'Categoria', { max: 60 }) : null;
     const rows = await all(db, `SELECT * FROM fin_transactions WHERE deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`, ...ids);
-    if (op === 'confirmar') for (const t of rows) if (t.status === 'pendente') await guardReserve(db, await account(db, t.account_id), t.amount_cents, i);
+    // Confirmar em lote: soma tudo o que muda o saldo de cada conta e verifica uma vez por conta.
+    // Duas despesas que cabem sozinhas no dinheiro livre podem, juntas, avançar sobre a reserva.
     const at = nowIso(), stmts = [];
+    // Voltar para pendente ou excluir lançamentos confirmados também muda o saldo (o sinal inverte).
+    if (op !== 'categoria') {
+      const perAccount = new Map();
+      for (const t of rows) {
+        const effect = op === 'confirmar' ? (t.status === 'pendente' ? t.amount_cents : 0) : (t.status === 'confirmada' && !t.transfer_id ? -t.amount_cents : 0);
+        if (effect) perAccount.set(t.account_id, (perAccount.get(t.account_id) || 0) + effect);
+      }
+      for (const [accId, total] of perAccount) stmts.push(...await guardReserve(db, await account(db, accId), total, i));
+    }
     for (const t of rows) {
       const after = op === 'excluir' ? null : { ...t, status: op === 'confirmar' ? 'confirmada' : op === 'pendente' ? 'pendente' : t.status, category: category || t.category };
       stmts.push(op === 'excluir'
@@ -469,15 +487,23 @@ export async function finRoutes(request, env, parts, url) {
     const acc = await account(db, i.account_id);
     const status = v.oneOf(i.status || 'pendente', 'Status', ['pendente', 'confirmada']);
     if (!Array.isArray(i.rows) || !i.rows.length || i.rows.length > 2000) fail(400, 'Envie entre 1 e 2000 linhas.');
-    const rows = [];
+    const rows = [], occurrences = new Map();
     for (const r of i.rows) {
       const amount = v.cents(r.amount_cents, `Linha ${r.line}: valor`, { allowNegative: true });
       const date = v.date(r.date, `Linha ${r.line}: data`);
       const description = v.text(r.description, `Linha ${r.line}: descrição`);
-      const hash = await sha256([acc.id, date, amount, description.toLowerCase()].join('|'));
-      rows.push({ account_id: acc.id, kind: amount > 0 ? 'receita' : 'despesa', amount_cents: amount, currency: acc.currency, date, description,
-        merchant: description.slice(0, 120), category: v.text(r.category || 'Outros', 'Categoria', { max: 60 }),
-        status: r.pending ? 'pendente' : status, import_hash: hash, notes: 'Importado de extrato CSV' });
+      // Duas compras iguais no mesmo dia são duas compras: a 2ª, 3ª… linha idêntica do arquivo
+      // recebe um número de ocorrência. Reimportar o mesmo arquivo gera os mesmos códigos.
+      const key = [acc.id, date, amount, description.toLowerCase()].join('|');
+      const n = occurrences.get(key) || 0; occurrences.set(key, n + 1);
+      const hash = await sha256(n ? `${key}|#${n}` : key);
+      // Possível transferência entre contas suas (Revolut: TRANSFER/TOPUP/EXCHANGE): entra como
+      // ajuste pendente, fora de receitas e despesas, até você revisar.
+      const transfer = v.bool(r.transfer) === 1;
+      rows.push({ account_id: acc.id, kind: transfer ? 'ajuste' : amount > 0 ? 'receita' : 'despesa', amount_cents: amount, currency: acc.currency, date, description,
+        merchant: description.slice(0, 120), category: transfer ? 'Transferência (revisar)' : v.text(r.category || 'Outros', 'Categoria', { max: 60 }),
+        status: r.pending || transfer ? 'pendente' : status, import_hash: hash,
+        notes: transfer ? 'Importado de extrato CSV. Parece transferência entre contas: se foi pagamento ou recebimento, mude o tipo.' : 'Importado de extrato CSV' });
     }
     const existing = new Set();
     for (let k = 0; k < rows.length; k += 90) {
@@ -486,7 +512,10 @@ export async function finRoutes(request, env, parts, url) {
     }
     const seen = new Set();
     const fresh = rows.filter(r => !existing.has(r.import_hash) && !seen.has(r.import_hash) && seen.add(r.import_hash));
-    for (let k = 0; k < fresh.length; k += 200) await createMany(db, 'fin_transactions', fresh.slice(k, k + 200), 'importação CSV');
+    // Linhas confirmadas mudam o saldo agora: a proteção da reserva vale para o efeito total do arquivo.
+    const net = fresh.filter(r => r.status === 'confirmada').reduce((s, r) => s + r.amount_cents, 0);
+    const g = await guardReserve(db, acc, net, i);
+    for (let k = 0; k < fresh.length; k += 200) await createMany(db, 'fin_transactions', fresh.slice(k, k + 200), 'importação CSV', k ? [] : g);
     return json({ imported: fresh.length, skipped: rows.length - fresh.length }, 201);
   }
 

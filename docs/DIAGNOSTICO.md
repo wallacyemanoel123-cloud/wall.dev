@@ -26,6 +26,23 @@ Auditoria feita antes da v1.0. O piloto original foi **preservado sem alteraçõ
 | Faltas financeiras | Contas, transferências, reserva, conciliação, recibos com OCR local, recorrências, delivery, relatórios, CSV |
 | PWA | Manifesto completo, ícones 192/512/maskable/apple, service worker sem cache de dados |
 
+## Correções após revisão externa (15/10/2026)
+
+Achados de uma revisão do commit `50a8112`, todos confirmados na leitura do código e cobertos por teste:
+
+- **Lote somava errado contra a reserva.** Confirmar em lote verificava cada despesa sozinha contra o mesmo saldo. Agora soma o efeito de todas as linhas por conta e verifica uma vez.
+- **Voltar para pendente ou excluir.** Ao voltar uma entrada para pendente ou excluí-la, o saldo diminui. Isso agora passa pela mesma proteção da reserva (no lote e na exclusão individual, com `?confirm_reserve=1`).
+- **CSV confirmado sem proteção.** A importação como “confirmada” agora verifica o efeito líquido do arquivo e pede confirmação se avançar sobre a reserva.
+- **Gravações simultâneas.** Antes, duas saídas que cabiam sozinhas podiam passar juntas, por exemplo uma do celular e outra do notebook. Agora a gravação inclui uma verificação da revisão (`revisionCheck`) e é desfeita inteira, com 409, se outra gravação ocorrer entre a verificação e a escrita.
+  - Esse caminho foi testado com SQLite (`tests/unit/revision-guard.test.mjs`).
+  - No `wrangler pages dev` os pedidos chegaram em série, então o teste ponta a ponta exercitou o 428, não o 409.
+- **Transferências no CSV.** Linhas do tipo `TRANSFER`/`TOPUP`/`EXCHANGE` (Revolut) e descrições como “To EUR…”, “Exchanged to…” e “Transferência entre contas” entram como **ajuste pendente**, categoria “Transferência (revisar)”. Assim ficam fora de receitas e despesas até o titular revisar.
+  - Um `TRANSFER` pode ser pagamento a outra pessoa. Nesse caso, mude o tipo para despesa.
+- **Deduplicação.** Duas compras idênticas no mesmo arquivo (mesma conta, data, valor e descrição) agora são duas. A 2ª, 3ª… recebem número de ocorrência no código de importação. Reimportar o mesmo arquivo continua não duplicando, e a 1ª ocorrência mantém o código antigo, compatível com o que já foi importado.
+- **Teste de lote.** “Classificar e confirmar” agora confirma o lote pela tela e confere o status.
+
+Resultado nesta máquina (Node 22, wrangler 4.42 local, Chromium): `npm test` 29/29 e `npm run test:e2e` 34/34. **Ainda não verificado:** CI no GitHub (nenhuma execução registrada), versão publicada, migração em produção, iPhone físico.
+
 ## Publicação
 
 Cloudflare Pages + Functions + D1 cabem no plano gratuito. R2 não foi usado (exige cartão). O ambiente de desenvolvimento usado na entrega não tinha credenciais nem acesso de rede à Cloudflare; a publicação é feita pelo titular (README) ou pelo GitHub Actions.

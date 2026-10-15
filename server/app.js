@@ -5,7 +5,7 @@ import { finRoutes } from './fin.js';
 import { osRoutes, reorder } from './os.js';
 import { backup, restore, importPilot } from './backup.js';
 import { assistantRoutes } from './assistant.js';
-import { revision } from './store.js';
+import { revision, isRevisionConflict } from './store.js';
 
 export async function handle(request, env) {
   try {
@@ -38,6 +38,7 @@ export async function handle(request, env) {
     fail(404, 'Operação não encontrada.');
   } catch (e) {
     if (e instanceof HttpError) return json({ error: e.message, ...(e.extra || {}) }, e.status);
+    if (isRevisionConflict(e)) return json({ error: 'Outro aparelho gravou ao mesmo tempo e o saldo mudou. Nada foi salvo. Confira e tente de novo.' }, 409);
     console.error(e);
     return json({ error: 'Falha interna no servidor. Atualize a tela e confira antes de tentar de novo.' }, 500);
   }

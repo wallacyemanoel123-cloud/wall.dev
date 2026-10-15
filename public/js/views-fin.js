@@ -70,7 +70,7 @@ export function editTransaction(t, refresh, preset = {}) {
     ],
     extra: t ? [{ label: 'Excluir', danger: true, onClick: async dlg => {
       if (!await confirmDialog('Excluir lançamento', 'O lançamento sai dos saldos. O histórico de auditoria guarda a versão anterior.', { confirmLabel: 'Excluir', danger: true })) return;
-      await del('fin/transactions/' + t.id); dlg.close(); toast('Lançamento excluído.'); await refresh();
+      await withReserveConfirm(confirm_reserve => del('fin/transactions/' + t.id + (confirm_reserve ? '?confirm_reserve=1' : ''))); dlg.close(); toast('Lançamento excluído.'); await refresh();
     } }] : [],
     onSubmit: async val => {
       const amount = t?.kind === 'ajuste' ? Math.sign(t.amount_cents || 1) * val.amount : val.amount;
@@ -756,7 +756,7 @@ function renderCsv(work, refresh) {
     <div class="banner small">Formato detectado: <b>${esc(cols.preset)}</b> · ${parsed.rows.length} linha(s) em “${esc(csvState.name)}”. Confira as colunas.</div>
     <form id="csv-map" class="filters">
       <label>Conta do extrato<select name="account">${accountOptions().map(([v, l]) => `<option value="${esc(v)}"${v === acc.id ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-      ${['date:Data', 'description:Descrição', 'amount:Valor (com sinal)', 'debit:Débito', 'credit:Crédito', 'fee:Taxa', 'state:Situação'].map(x => { const [k, l] = x.split(':'); return `<label>${l}<select name="${k}">${opts(cols[k])}</select></label>`; }).join('')}
+      ${['date:Data', 'description:Descrição', 'amount:Valor (com sinal)', 'debit:Débito', 'credit:Crédito', 'fee:Taxa', 'state:Situação', 'type:Tipo do movimento'].map(x => { const [k, l] = x.split(':'); return `<label>${l}<select name="${k}">${opts(cols[k])}</select></label>`; }).join('')}
       <label>Importar como<select name="status"><option value="pendente">Pendente (revisar depois)</option><option value="confirmada">Confirmada (entra no saldo)</option></select></label>
     </form>
     ${anchor ? `<div class="banner small">Linhas até ${fmtDate(anchor.date)} (data do saldo de referência de ${esc(acc.name)}) vêm desmarcadas: já estão contidas no saldo e importá-las não mudaria o saldo, só o histórico.</div>` : ''}
@@ -764,13 +764,13 @@ function renderCsv(work, refresh) {
     <div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="csv-all" aria-label="Marcar todas"></th><th>Data</th><th>Descrição</th><th class="r">Valor</th><th>Observação</th></tr></thead><tbody>
       ${marked.map((r, k) => `<tr><td><input type="checkbox" data-row="${k}"${r.include ? ' checked' : ''} aria-label="Importar linha ${r.line}"></td><td>${fmtDate(r.date)}</td><td>${esc(r.description)}</td>
         <td class="r money ${r.amount_cents < 0 ? 'neg' : 'pos'}">${money(r.amount_cents, acc.currency, { sign: true })}</td>
-        <td class="small">${r.dup ? `<span class="tag warn">Possível duplicado</span> ${esc(r.dup.description)}` : ''}${r.before ? '<span class="tag">Antes do saldo de referência</span>' : ''}${r.pending ? '<span class="tag warn">Pendente no banco</span>' : ''}</td></tr>`).join('')}</tbody></table></div>
+        <td class="small">${r.dup ? `<span class="tag warn">Possível duplicado</span> ${esc(r.dup.description)}` : ''}${r.before ? '<span class="tag">Antes do saldo de referência</span>' : ''}${r.pending ? '<span class="tag warn">Pendente no banco</span>' : ''}${r.transfer ? '<span class="tag">Transferência? Entra pendente, fora de receitas e despesas</span>' : ''}</td></tr>`).join('')}</tbody></table></div>
     <div class="actions"><button class="primary" id="csv-import">Importar linhas marcadas</button><button id="csv-cancel">Cancelar</button></div>`;
   const map = work.querySelector('#csv-map');
   map.addEventListener('change', () => {
     const f = Object.fromEntries(new FormData(map));
     csvState.account = f.account; csvState.status = f.status;
-    for (const k of ['date', 'description', 'amount', 'debit', 'credit', 'fee', 'state']) cols[k] = Number(f[k]);
+    for (const k of ['date', 'description', 'amount', 'debit', 'credit', 'fee', 'state', 'type']) cols[k] = Number(f[k]);
     renderCsv(work, refresh);
   });
   if (csvState.status) map.status.value = csvState.status;
@@ -782,7 +782,7 @@ function renderCsv(work, refresh) {
     if (!await confirmDialog('Importar extrato', `Importar ${chosen.length} linha(s) em ${acc.name} como ${map.status.value === 'confirmada' ? 'confirmadas (alteram o saldo)' : 'pendentes (não alteram o saldo até você confirmar)'}?`)) return;
     e.target.disabled = true;
     try {
-      const r = await post('fin/import/csv', { account_id: acc.id, status: map.status.value, rows: chosen.map(x => ({ line: x.line, date: x.date, description: x.description, amount_cents: x.amount_cents, pending: x.pending })) });
+      const r = await withReserveConfirm(confirm_reserve => post('fin/import/csv', { account_id: acc.id, status: map.status.value, confirm_reserve, rows: chosen.map(x => ({ line: x.line, date: x.date, description: x.description, amount_cents: x.amount_cents, pending: x.pending, transfer: x.transfer })) }));
       csvState = null; toast(`${r.imported} importada(s); ${r.skipped} já existiam.`); await refresh();
     } catch (err) { toast(err.message, 'error'); e.target.disabled = false; }
   };

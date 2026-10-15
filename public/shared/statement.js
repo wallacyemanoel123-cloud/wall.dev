@@ -46,6 +46,7 @@ export function detectColumns(headers) {
     fee: find(headers, ['fee', 'taxa', 'tarifa']),
     currency: find(headers, ['currency', 'moeda', 'divisa']),
     state: find(headers, ['state', 'status', 'estado', 'situacao']),
+    type: revolut ? find(headers, ['type']) : -1,
   };
 }
 
@@ -73,6 +74,10 @@ export function parseSignedAmount(s) {
 
 const SKIP_STATES = ['reverted', 'declined', 'failed', 'cancelled', 'canceled', 'revertida', 'recusada', 'cancelada', 'estornada'];
 const PENDING_STATES = ['pending', 'pendente', 'em processamento'];
+// Movimentos que costumam ser dinheiro indo de uma conta sua para outra (não é receita nem despesa).
+const TRANSFER_TYPES = ['transfer', 'topup', 'top-up', 'exchange'];
+const TRANSFER_DESC = /^(to|from) (eur|brl|usd|gbp)\b|^exchanged? to\b|^(top-?up|recarga)\b|transfer(e|ê)ncia entre contas/i;
+export const looksLikeTransfer = (type, description) => TRANSFER_TYPES.includes(norm(type)) || TRANSFER_DESC.test(String(description || '').trim());
 
 export function toTransactions(parsed, cols, defaultCurrency) {
   const out = [], errors = [];
@@ -93,7 +98,8 @@ export function toTransactions(parsed, cols, defaultCurrency) {
     if (!date) { errors.push({ line, reason: 'data não reconhecida' }); return; }
     if (amount === null || amount === 0) { errors.push({ line, reason: 'valor não reconhecido ou zero' }); return; }
     const currency = cols.currency >= 0 && /^(EUR|BRL)$/i.test(String(r[cols.currency]).trim()) ? String(r[cols.currency]).trim().toUpperCase() : defaultCurrency;
-    out.push({ line, date, description: description || 'Sem descrição', amount_cents: amount - fee, currency, pending: PENDING_STATES.includes(state) });
+    const transfer = looksLikeTransfer(cols.type >= 0 ? r[cols.type] : '', description);
+    out.push({ line, date, description: description || 'Sem descrição', amount_cents: amount - fee, currency, pending: PENDING_STATES.includes(state), transfer });
   });
   return { rows: out, errors };
 }

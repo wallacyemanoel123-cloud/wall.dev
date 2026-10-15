@@ -390,6 +390,57 @@ await step('Importação de extrato CSV: preview, duplicados e reimportação se
   assert.ok(st.transactions.filter(t => t.import_hash).every(t => t.status === 'pendente'), 'importadas como pendentes não mexem no saldo');
 });
 
+await step('Reserva: lote, CSV confirmado e gravações simultâneas respeitam a soma', async () => {
+  const acc = await accId(P, 'Carteira Teste EUR');
+  const free = async () => (await api(P, 'fin/state')).body;
+  const st0 = await free();
+  const created = [];
+  // Livre agora: € 52,00 (97 − 40 − 5). Duas despesas de € 30 cabem sozinhas, juntas não.
+  for (const d of ['Lote A', 'Lote B']) {
+    const r = await api(P, 'fin/transactions', { account_id: acc, kind: 'despesa', amount_cents: 3000, date: '2026-10-12', description: d, status: 'pendente' });
+    assert.equal(r.status, 201, d); created.push(r.body.id);
+  }
+  const bulk = await api(P, 'fin/transactions/bulk', { ids: created, action: 'confirmar' });
+  assert.equal(bulk.status, 428, 'lote soma as despesas antes de confirmar');
+  const one = await api(P, 'fin/transactions/bulk', { ids: [created[0]], action: 'confirmar' });
+  assert.equal(one.status, 200, 'uma só cabe no livre');
+  const csvConf = await api(P, 'fin/import/csv', { account_id: acc, status: 'confirmada', rows: [{ line: 2, date: '2026-10-12', description: 'Csv grande', amount_cents: -3000 }] });
+  assert.equal(csvConf.status, 428, 'CSV confirmado também protege a reserva');
+  // Duas gravações ao mesmo tempo, cada uma cabendo sozinha no livre restante (€ 22): no máximo uma passa.
+  const race = await Promise.all(['Corrida 1', 'Corrida 2'].map(d => api(P, 'fin/transactions', { account_id: acc, kind: 'despesa', amount_cents: 1500, date: '2026-10-12', description: d })));
+  assert.ok(race.filter(r => r.status === 201).length <= 1, `simultâneas: ${race.map(r => r.status)}`);
+  assert.ok(race.every(r => [201, 409, 428].includes(r.status)), `simultâneas: ${race.map(r => r.status)}`);
+  if (process.env.RACE_LOG) console.log('    corrida:', race.map(r => r.status + ' ' + (r.body?.error || '')).join(' | '));
+  for (const r of race) if (r.status === 201) created.push(r.body.id);
+  const st1 = await free();
+  const dash = st1.transactions.filter(t => t.account_id === acc && t.status === 'confirmada' && !t.deleted_at);
+  assert.ok(dash.length > 0);
+  // Duplicadas legítimas: duas compras iguais no mesmo dia continuam sendo duas; reimportar não duplica.
+  const twin = { date: '2026-10-12', description: 'Café da estação', amount_cents: -250 };
+  const t1 = await api(P, 'fin/import/csv', { account_id: acc, rows: [{ line: 2, ...twin }, { line: 3, ...twin }] });
+  assert.deepEqual(t1.body, { imported: 2, skipped: 0 });
+  const t2 = await api(P, 'fin/import/csv', { account_id: acc, rows: [{ line: 2, ...twin }, { line: 3, ...twin }] });
+  assert.deepEqual(t2.body, { imported: 0, skipped: 2 });
+  // Transferência entre contas no CSV: ajuste pendente, fora de receitas e despesas.
+  const tr = await api(P, 'fin/import/csv', { account_id: acc, status: 'confirmada', rows: [{ line: 2, date: '2026-10-12', description: 'To EUR Revolut', amount_cents: 5000, transfer: true }] });
+  assert.equal(tr.status, 201);
+  const st2 = await free();
+  const imported = st2.transactions.filter(t => t.import_hash && !st1.transactions.some(x => x.id === t.id));
+  const trRow = imported.find(t => t.description === 'To EUR Revolut');
+  assert.equal(trRow.kind, 'ajuste'); assert.equal(trRow.status, 'pendente');
+  // Excluir uma entrada confirmada também tira do livre: pede confirmação se invadir a reserva.
+  const inc = await api(P, 'fin/transactions', { account_id: acc, kind: 'receita', amount_cents: 10000, date: '2026-10-12', description: 'Entrada a excluir' });
+  assert.equal(inc.status, 201);
+  const big = await api(P, 'fin/transactions', { account_id: acc, kind: 'despesa', amount_cents: 9000, date: '2026-10-12', description: 'Usa a entrada' });
+  assert.equal(big.status, 201); created.push(big.body.id);
+  assert.equal((await api(P, 'fin/transactions/' + inc.body.id, undefined, 'DELETE')).status, 428, 'excluir entrada que sustenta o livre');
+  assert.equal((await api(P, 'fin/transactions/bulk', { ids: [inc.body.id], action: 'pendente' })).status, 428, 'voltar entrada para pendente');
+  assert.equal((await api(P, 'fin/transactions/' + inc.body.id + '?confirm_reserve=1', undefined, 'DELETE')).status, 200, 'com confirmação explícita');
+  // Limpeza: os passos seguintes contam com o saldo anterior.
+  for (const id of [...created, ...imported.map(t => t.id)]) assert.equal((await api(P, 'fin/transactions/' + id, undefined, 'DELETE')).status, 200);
+  assert.equal((await free()).transactions.filter(t => !t.deleted_at).length, st0.transactions.filter(t => !t.deleted_at).length);
+});
+
 await step('Lançamentos em lote: classificar e confirmar', async () => {
   await P.goto(BASE + '/#/lancamentos'); await P.reload();
   await P.locator('#filters [name="status"]').selectOption('pendente');
@@ -398,8 +449,18 @@ await step('Lançamentos em lote: classificar e confirmar', async () => {
   await P.locator('[data-bulk="categoria"]').click();
   await fill(P, 'category', 'Mercado'); await save(P);
   await P.locator('#toast', { hasText: 'atualizados' }).waitFor();
-  const st = (await api(P, 'fin/state')).body;
-  assert.ok(st.transactions.filter(t => t.import_hash).every(t => t.category === 'Mercado'));
+  let st = (await api(P, 'fin/state')).body;
+  const pend = st.transactions.filter(t => t.import_hash && !t.deleted_at);
+  assert.ok(pend.length >= 2 && pend.every(t => t.category === 'Mercado'));
+  assert.equal(pend.find(t => t.description === 'Pagamento recebido').kind, 'ajuste', 'TRANSFER da Revolut entra como transferência a revisar');
+  // Confirmar o lote pela tela: os pendentes passam a contar no saldo.
+  await P.locator('#filters [name="status"]').selectOption('pendente');
+  await P.locator('[data-act="select"]').click();
+  await P.locator('#sel-all').check();
+  await P.locator('[data-bulk="confirmar"]').click();
+  await P.locator('#toast', { hasText: 'atualizados' }).last().waitFor();
+  st = (await api(P, 'fin/state')).body;
+  assert.ok(st.transactions.filter(t => pend.some(p => p.id === t.id)).every(t => t.status === 'confirmada'), 'lote confirmado');
 });
 
 await step('Investimentos: operações registradas sem criar lançamentos', async () => {

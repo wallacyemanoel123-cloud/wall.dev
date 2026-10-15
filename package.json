@@ -5,7 +5,7 @@
   "type": "module",
   "description": "WALL Finance v1.0 — finanças pessoais (módulo do WALL OS) em Cloudflare Pages + D1",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5"
   },
   "scripts": {
     "dev": "node scripts/vendor-ocr.mjs && wrangler pages dev public --port 8788",

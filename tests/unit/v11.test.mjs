@@ -77,3 +77,15 @@ test('assistente responde as perguntas principais pelas regras', () => {
   assert.equal(detectIntent('Qual é o progresso das minhas metas?'), 'metas');
   assert.equal(answer('qual a capital da França?', ctx), null);
 });
+
+test('extrato: transferências entre contas são marcadas para revisão', () => {
+  const csv = 'Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance\n'
+    + 'CARD_PAYMENT,Current,2026-10-11 10:00:00,2026-10-11 10:05:00,Padaria,-3.10,0.00,EUR,COMPLETED,1\n'
+    + 'TOPUP,Current,2026-10-11 11:00:00,2026-10-11 11:00:00,Top-Up by *1234,50.00,0.00,EUR,COMPLETED,1\n'
+    + 'EXCHANGE,Current,2026-10-11 12:00:00,2026-10-11 12:00:00,Exchanged to BRL,-20.00,0.00,EUR,COMPLETED,1\n';
+  const p = parseCSV(csv), cols = detectColumns(p.headers);
+  const { rows } = toTransactions(p, cols, 'EUR');
+  assert.deepEqual(rows.map(r => r.transfer), [false, true, true]);
+  const generic = parseCSV('Data;Descrição;Valor\n11/10/2026;Transferência entre contas;-10,00\n11/10/2026;Mercado;-5,00\n');
+  assert.deepEqual(toTransactions(generic, detectColumns(generic.headers), 'EUR').rows.map(r => r.transfer), [true, false]);
+});
