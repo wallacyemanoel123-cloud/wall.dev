@@ -20,6 +20,7 @@
 | Delivery | Turnos com horas, km, pedidos, ganhos, gorjetas e custos; €/hora e €/km; lançamento opcional no extrato |
 | Metas financeiras | Patrimônio, reserva (contas + valores reservados), conta ou manuais |
 | Investimentos | Operações (compra, venda, aporte, resgate, rendimento, taxa) e posição; nenhuma ordem é executada |
+| Cérebro WALL (Wall Bot) | Memória (fatos, decisões, hipóteses, pendências, evidências), tarefas com evidência obrigatória, comando pelo **Telegram** autenticado (`/status`, `/tarefa`, `/despesa` → `/confirmar`), sem duplicar reenvios. Detalhes em [docs/WALL-BRAIN.md](docs/WALL-BRAIN.md) |
 | Lista de desejos | Prioridade, preço, link, situação, ordem; indica se cabe no disponível |
 | Relatórios | Mês a mês, 6 meses em gráfico, categorias, por dia; CSV; impressão/PDF |
 | WALL OS | Hoje (visão do dia), planejamento, metas de curto/médio/longo prazo, projetos e negócios, calendário, diário, checklist, hábitos (sono, hidratação, exercício), estudos de inglês. Criar, editar, concluir, arquivar e reordenar pela interface |

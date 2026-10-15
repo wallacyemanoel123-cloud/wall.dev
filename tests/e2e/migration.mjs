@@ -22,7 +22,7 @@ run('d1', 'execute', 't', '--command', `INSERT INTO fin_accounts (id,name,curren
 for (const f of files.slice(1)) copyFileSync(join(root, 'migrations', f), join(mig, f));
 run('d1', 'migrations', 'apply', 't');
 const raw = (run('d1', 'execute', 't', '--json', '--command', `SELECT (SELECT count(*) FROM fin_transactions) tx, (SELECT amount_cents FROM fin_transactions) amt,
-  (SELECT title || '|' || version || '|' || archived FROM os_items) os, (SELECT count(*) FROM fin_audit) audit, (SELECT count(*) FROM fin_reserves) reserves`));
+  (SELECT title || '|' || version || '|' || archived FROM os_items) os, (SELECT count(*) FROM fin_audit) audit, (SELECT count(*) FROM fin_reserves) reserves, (SELECT count(*) FROM brain_tasks) + (SELECT count(*) FROM brain_memory) brain`));
 const out = JSON.parse(raw.slice(raw.indexOf('[')));
-assert.deepEqual(out[0].results[0], { tx: 1, amt: -100, os: 'Antigo|3|0', audit: 1, reserves: 0 });
+assert.deepEqual(out[0].results[0], { tx: 1, amt: -100, os: 'Antigo|3|0', audit: 1, reserves: 0, brain: 0 });
 console.log(`  ✔ Migrações ${files.join(', ')} preservam os dados existentes`);

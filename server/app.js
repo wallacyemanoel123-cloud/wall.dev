@@ -5,6 +5,7 @@ import { finRoutes } from './fin.js';
 import { osRoutes, reorder } from './os.js';
 import { backup, restore, importPilot } from './backup.js';
 import { assistantRoutes } from './assistant.js';
+import { brainRoutes, telegramWebhook } from './brain.js';
 import { revision, isRevisionConflict } from './store.js';
 
 export async function handle(request, env) {
@@ -18,6 +19,8 @@ export async function handle(request, env) {
 
     if (parts[0] === 'health') return json({ ok: true, configured: Boolean(env.OWNER_EMAIL && env.OWNER_PASSWORD_HASH) });
     if (parts[0] === 'auth' && parts[1] === 'login' && method === 'POST') return await login(request, env);
+    // Telegram não tem sessão: autentica pelo segredo do webhook e pelo ID do proprietário.
+    if (parts[0] === 'telegram' && parts[1] === 'webhook' && method === 'POST' && parts.length === 2) return await telegramWebhook(request, env);
 
     const session = await currentSession(request, env);
     if (!session) fail(401, 'Entre com seu e-mail e senha.');
@@ -30,6 +33,7 @@ export async function handle(request, env) {
     if (parts[0] === 'revision') return json({ revision: await revision(env.DB) });
     if (parts[0] === 'fin') return await finRoutes(request, env, parts.slice(1), url);
     if (parts[0] === 'os') return await osRoutes(request, env, parts.slice(1));
+    if (parts[0] === 'brain') return await brainRoutes(request, env, parts.slice(1));
     if (parts[0] === 'assistant') return await assistantRoutes(request, env, parts.slice(1));
     if (parts[0] === 'reorder' && method === 'POST') return await reorder(request, env);
     if (parts[0] === 'backup' && method === 'GET') return await backup(env, url.searchParams.get('anexos') === '1');

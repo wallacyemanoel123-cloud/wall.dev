@@ -4,3 +4,7 @@ OWNER_EMAIL='voce@example.com'
 OWNER_PASSWORD_HASH='pbkdf2-sha256$100000$...$...'
 # Opcional (IA externa, pode ter custo):
 # ANTHROPIC_API_KEY='...'
+# Opcional (WALL Brain pelo Telegram). Em produção, cadastre como SECRET na Cloudflare.
+# TELEGRAM_WEBHOOK_SECRET='senha-aleatoria-longa'
+# TELEGRAM_OWNER_ID='123456789'
+# BRAIN_EXECUTORS=''   # agentes com executor cloud testado (ex.: codex). Vazio = nenhum.

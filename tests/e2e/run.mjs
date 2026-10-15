@@ -26,10 +26,16 @@ async function step(name, fn) {
 
 execFileSync(wrangler, ['d1', 'migrations', 'apply', 'wall-finance', '--local', '--persist-to', persist], { cwd: root, stdio: 'ignore', env: { ...process.env, CI: '1' } });
 const hash = await hashPassword(PASSWORD);
-const server = spawn(wrangler, ['pages', 'dev', 'public', '--port', String(PORT), '--persist-to', persist, '--binding', `OWNER_EMAIL=${EMAIL}`, '--binding', `OWNER_PASSWORD_HASH=${hash}`],
+const TG_SECRET = 'segredo-de-teste-do-webhook-telegram-0123456789', TG_OWNER = 424242;
+let server, log = '';
+async function startServer() {
+  server = spawn(wrangler, ['pages', 'dev', 'public', '--port', String(PORT), '--persist-to', persist, '--binding', `OWNER_EMAIL=${EMAIL}`, '--binding', `OWNER_PASSWORD_HASH=${hash}`,
+    '--binding', `TELEGRAM_WEBHOOK_SECRET=${TG_SECRET}`, '--binding', `TELEGRAM_OWNER_ID=${TG_OWNER}`],
   { cwd: root, env: { ...process.env, CI: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
-let log = ''; server.stdout.on('data', d => { log += d; }); server.stderr.on('data', d => { log += d; });
-for (let i = 0; i < 60; i++) { try { if ((await fetch(BASE + '/api/health')).ok) break; } catch { /* aguardando */ } await new Promise(r => setTimeout(r, 500)); }
+  server.stdout.on('data', d => { log += d; }); server.stderr.on('data', d => { log += d; });
+  for (let i = 0; i < 60; i++) { try { if ((await fetch(BASE + '/api/health')).ok) break; } catch { /* aguardando */ } await new Promise(r => setTimeout(r, 500)); }
+}
+await startServer();
 
 const browser = await chromium.launch({ executablePath: chromePath });
 const errors = [];
@@ -586,6 +592,97 @@ await step('Configuração inicial por JSON cria contas, fotografias “a confir
   assert.equal(st.accounts.find(a => a.name === 'Seed Reserva').is_reserve, 1);
   assert.ok(st.goals.some(g => g.name === 'Seed patrimônio' && g.target_cents === 5000000));
   assert.equal(st.transactions.filter(t => t.account_id === acc.id).length, 0, 'nenhum lançamento retroativo');
+});
+
+
+// ───── WALL Brain: Telegram autenticado, deduplicação, propostas e persistência ─────
+let tgUpdate = 1000, firstTaskUpdate = null;
+const tg = async (text, { from = TG_OWNER, secret = TG_SECRET, update_id = ++tgUpdate, chat = 'private' } = {}) => {
+  const r = await fetch(BASE + '/api/telegram/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(secret ? { 'X-Telegram-Bot-Api-Secret-Token': secret } : {}) },
+    body: JSON.stringify({ update_id, message: { message_id: update_id, date: 0, text, from: { id: from, is_bot: false, first_name: 'T' }, chat: { id: from, type: chat } } }) });
+  return { status: r.status, body: await r.json().catch(() => null), update_id };
+};
+
+await step('Telegram: sem segredo ou com segredo errado é recusado; outro usuário recebe recusa sem dados', async () => {
+  assert.equal((await tg('/status', { secret: null })).status, 401);
+  assert.equal((await tg('/status', { secret: 'errado' })).status, 401);
+  const intruso = await tg('/financeiro', { from: 999 });
+  assert.equal(intruso.status, 200);
+  assert.equal(intruso.body.text, 'Este bot é privado.');
+  assert.equal((await tg('/status', { chat: 'group' })).body.text, 'Este bot é privado.', 'grupo não comanda, nem com o ID certo');
+});
+
+await step('Telegram: /tarefa cria uma vez mesmo com reenvio; agente sem executor fica bloqueado', async () => {
+  const a = await tg('/tarefa Revisar página Say It Right #ofertas @codex'); firstTaskUpdate = a.update_id;
+  assert.match(a.body.text, /Tarefa T-[A-Z0-9]{5} criada/);
+  assert.match(a.body.text, /Bloqueada: Sem executor cloud/);
+  const again = await tg('/tarefa Revisar página Say It Right #ofertas @codex', { update_id: a.update_id });
+  assert.equal(again.body.duplicate, true, 'mesmo update_id não processa de novo');
+  const st = (await api(P, 'brain/state')).body;
+  assert.equal(st.tasks.filter(t => t.title === 'Revisar página Say It Right').length, 1);
+  assert.equal(st.tasks[0].status, 'blocked');
+  const status = await tg('/status');
+  assert.match(status.body.text, /1 bloqueadas/); assert.match(status.body.text, /nenhum conectado/);
+});
+
+await step('Telegram: /despesa propõe sem gravar; /confirmar grava UMA vez como pendente; código errado é recusado', async () => {
+  const before = (await api(P, 'fin/state')).body.transactions.length;
+  const p = await tg('/despesa 12,50 Café do teste @carteira');
+  assert.match(p.body.text, /Proposta de despesa: −€\s12,50/);
+  assert.match(p.body.text, /Conta: Carteira Teste EUR/);
+  const code = p.body.text.match(/\/confirmar ([0-9A-F]{6})/)[1];
+  assert.equal((await api(P, 'fin/state')).body.transactions.length, before, 'proposta não grava');
+  const other = await tg('/despesa 99 Outra coisa @carteira');
+  const otherCode = other.body.text.match(/\/confirmar ([0-9A-F]{6})/)[1];
+  assert.notEqual(code, otherCode, 'conteúdo diferente, código diferente');
+  assert.match((await tg('/confirmar 000000')).body.text, /Código não encontrado/);
+  const ok = await tg('/confirmar ' + code);
+  assert.match(ok.body.text, /Gravado como PENDENTE em Carteira Teste EUR/);
+  const twice = await tg('/confirmar ' + code);
+  assert.match(twice.body.text, /já está confirmada/);
+  const resent = await tg('/confirmar ' + code, { update_id: ok.update_id });
+  assert.equal(resent.body.duplicate, true);
+  const st = (await api(P, 'fin/state')).body;
+  const mine = st.transactions.filter(t => t.description === 'Café do teste');
+  assert.equal(mine.length, 1); assert.equal(mine[0].status, 'pendente'); assert.equal(mine[0].amount_cents, -1250);
+  assert.match((await tg('/cancelar ' + otherCode)).body.text, /cancelada/);
+  assert.match((await tg('/confirmar ' + otherCode)).body.text, /já está cancelada/);
+  assert.equal((await api(P, 'fin/state')).body.transactions.filter(t => t.description === 'Outra coisa').length, 0);
+  await api(P, 'fin/transactions/' + mine[0].id, undefined, 'DELETE');
+});
+
+await step('Telegram: /financeiro mostra saldo calculado com data de referência; /nota vai para a memória', async () => {
+  const f = await tg('/financeiro');
+  assert.match(f.body.text, /CALCULADOS/); assert.match(f.body.text, /Carteira Teste EUR: €/); assert.match(f.body.text, /referência/);
+  assert.match((await tg('/nota Conferir uma cobrança desconhecida')).body.text, /memória/);
+  assert.match((await tg('/xyz')).body.text, /não existe/);
+});
+
+await step('Painel do cérebro: tarefa só conclui com evidência; tela mostra tarefas, memória e eventos', async () => {
+  const t = (await api(P, 'brain/state')).body.tasks.find(x => x.title === 'Revisar página Say It Right');
+  const noEv = await api(P, 'brain/tasks', { ...t, status: 'done', evidence: '' });
+  assert.equal(noEv.status, 400);
+  const own = await api(P, 'brain/tasks', { title: 'Tarefa manual', agent: 'wallacy', status: 'ready' });
+  assert.equal(own.body.status, 'ready', 'tarefa do próprio Wallacy não precisa de executor');
+  const done = await api(P, 'brain/tasks', { ...own.body, status: 'done', evidence: 'Feito e conferido no app' });
+  assert.equal(done.body.status, 'done');
+  await P.goto(BASE + '/#/cerebro'); await P.reload();
+  await P.locator('h1', { hasText: 'Cérebro WALL' }).waitFor();
+  await P.locator('#brain-tasks', { hasText: 'Revisar página Say It Right' }).waitFor();
+  await P.locator('#brain-memory', { hasText: 'cobrança desconhecida' }).waitFor();
+  await P.locator('text=configurado no servidor').waitFor();
+  await snap(P, 'notebook-cerebro.png');
+});
+
+await step('Reinício do servidor não perde tarefas, memória nem repete ação já processada', async () => {
+  const before = (await api(P, 'brain/state')).body;
+  server.kill(); await new Promise(r => server.once('exit', r));
+  await startServer();
+  const after = (await api(P, 'brain/state')).body;
+  assert.equal(after.tasks.length, before.tasks.length);
+  assert.equal(after.memory.length, before.memory.length);
+  const replay = await tg('/tarefa repetida', { update_id: firstTaskUpdate });
+  assert.equal(replay.body.duplicate, true, 'evento antigo continua deduplicado depois do reinício');
 });
 
 await step('Sair encerra a sessão (dados voltam a exigir login)', async () => {

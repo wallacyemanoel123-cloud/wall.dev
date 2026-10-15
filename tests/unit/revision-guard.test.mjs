@@ -21,3 +21,21 @@ test('verificação de revisão desfaz a gravação quando outro aparelho gravou
   assert.equal(db.prepare('SELECT count(*) n FROM t').get().n, 1, 'gravação desfeita');
   assert.equal(db.prepare('SELECT value FROM sys_revision').get().value, 6);
 });
+
+// Mesmo SQL do /confirmar: se a proposta já não estava aguardando, a gravação inteira é desfeita.
+test('confirmar a mesma proposta duas vezes não grava o segundo lançamento', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec("CREATE TABLE sys_revision (id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO sys_revision VALUES (1, 1); CREATE TABLE p (id TEXT, status TEXT); INSERT INTO p VALUES ('x', 'aguardando'); CREATE TABLE tx (id TEXT);");
+  const confirm = () => {
+    db.exec('BEGIN');
+    try {
+      db.prepare("UPDATE p SET status = 'confirmada' WHERE id = 'x' AND status = 'aguardando'").run();
+      db.prepare('INSERT INTO sys_revision (id, value) SELECT 1, 0 WHERE changes() = 0').run();
+      db.prepare("INSERT INTO tx VALUES ('t')").run();
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+  };
+  confirm();
+  assert.throws(confirm, e => isRevisionConflict(e));
+  assert.equal(db.prepare('SELECT count(*) n FROM tx').get().n, 1);
+});

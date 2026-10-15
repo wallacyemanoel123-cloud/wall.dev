@@ -5,6 +5,7 @@ import { icon, toast, isDialogOpen, esc, applyTheme } from './js/ui.js';
 import * as fin from './js/views-fin.js';
 import * as os from './js/views-os.js';
 import * as more from './js/views-more.js';
+import * as brain from './js/views-brain.js';
 
 const ROUTES = [
   { group: 'WALL OS' },
@@ -31,6 +32,7 @@ const ROUTES = [
   { id: 'desejos', label: 'Lista de desejos', icon: 'star', view: fin.desejos },
   { id: 'relatorios', label: 'Relatórios', icon: 'chart', view: fin.relatorios },
   { group: 'Sistema' },
+  { id: 'cerebro', label: 'Cérebro WALL', icon: 'spark', view: brain.cerebro },
   { id: 'assistente', label: 'Assistente WALL', icon: 'spark', view: more.assistente },
   { id: 'dados', label: 'Dados e segurança', icon: 'shield', view: more.dados },
 ];
